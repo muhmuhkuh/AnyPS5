@@ -2571,6 +2571,14 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    set_tests_properties(agc_driver_image_gather_volume PROPERTIES FAIL_REGULAR_EXPRESSION "VUID-" TIMEOUT 30)
+    add_test(NAME agc_driver_image_plane_address_on_volume_table COMMAND agc_driver_image_plane_address_on_volume_tests --table-only)
+    set_tests_properties(agc_driver_image_plane_address_on_volume agc_driver_image_plane_address_on_volume_table PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "VUID-" TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_image_plane_address_on_volume_table PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_guarded_direct_root COMMAND agc_driver_guarded_null_pointer_tests --direct-root-only)
     set_tests_properties(agc_driver_guarded_direct_root PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
