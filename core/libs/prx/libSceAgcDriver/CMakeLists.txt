@@ -1515,6 +1515,35 @@ target_link_libraries(agc_driver_cmask_fast_clear_tests PRIVATE
 set_target_properties(agc_driver_cmask_fast_clear_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_cmask_fast_clear_tests)
 
+set(agcIndependentBlendSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/IndependentBlend.frag)
+set(agcIndependentBlendSpv ${agcTestShaderGeneratedRoot}/IndependentBlend.spv)
+set(agcIndependentBlendHeader ${agcTestShaderGeneratedRoot}/IndependentBlend_spv.h)
+add_custom_command(
+        OUTPUT "${agcIndependentBlendHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcIndependentBlendSpv}" "${agcIndependentBlendSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcIndependentBlendSpv} -DOUTPUT=${agcIndependentBlendHeader}
+        -DSYMBOL=INDEPENDENT_BLEND_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcIndependentBlendSource}" glslang-standalone
+        VERBATIM
+)
+add_test_executable(agc_independent_blend_tests EXCLUDE_FROM_ALL
+        tests/execution/IndependentBlend.cpp ${agcCoverShaderHeaders} ${agcIndependentBlendHeader})
+target_include_directories(agc_independent_blend_tests PRIVATE
+        ${LIBS_INCLUDE_DIR} ${agcTestShaderGeneratedRoot} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_independent_blend_tests PRIVATE libSceAgcDriver SDL2-static libc)
+configure_windows_unwind(agc_independent_blend_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_independent_blend_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_independent_blend_legacy COMMAND agc_independent_blend_tests)
+    set_tests_properties(agc_independent_blend_legacy PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1;APS5_PIPELINE_JOURNAL_THREADS=0;VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation")
+    if(WIN32)
+        set_tests_properties(agc_independent_blend_legacy PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 set(agcBufferUpdateSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/BufferUpdate.comp)
 set(agcBufferUpdateSpv ${agcTestShaderGeneratedRoot}/BufferUpdate.spv)
 set(agcBufferUpdateHeader ${agcTestShaderGeneratedRoot}/BufferUpdate_spv.h)
@@ -2172,6 +2201,7 @@ configure_windows_unwind(agc_driver_mesh_tests)
 
 set(ANYPS5_AGC_EXECUTION_TESTS "" CACHE STRING "tests/execution sources to build, by file name without extension; the others build a stub that reports a skip. Empty builds all")
 file(GLOB agcExecutionTestSources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/execution/*.cpp)
+list(REMOVE_ITEM agcExecutionTestSources "${CMAKE_CURRENT_SOURCE_DIR}/tests/execution/IndependentBlend.cpp")
 set(agcExecutionTests)
 foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     get_filename_component(agcExecutionTestName ${agcExecutionTestSource} NAME_WE)

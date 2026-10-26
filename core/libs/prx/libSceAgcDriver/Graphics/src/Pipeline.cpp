@@ -687,6 +687,22 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             blend.logicOpEnable = VK_TRUE;
             blend.logicOp = logicOp;
         }
+        if (!context.independentBlend) {
+            const auto uniform = [](const std::vector<VkPipelineColorBlendAttachmentState>& attachments) {
+                return attachments.empty() || std::ranges::all_of(attachments, [&](const auto& attachment) {
+                    const auto& first = attachments.front();
+                    return attachment.blendEnable == first.blendEnable &&
+                        attachment.srcColorBlendFactor == first.srcColorBlendFactor &&
+                        attachment.dstColorBlendFactor == first.dstColorBlendFactor &&
+                        attachment.colorBlendOp == first.colorBlendOp &&
+                        attachment.srcAlphaBlendFactor == first.srcAlphaBlendFactor &&
+                        attachment.dstAlphaBlendFactor == first.dstAlphaBlendFactor &&
+                        attachment.alphaBlendOp == first.alphaBlendOp &&
+                        attachment.colorWriteMask == first.colorWriteMask;
+                });
+            };
+            Require(uniform(firstChannels) && (!alternateAlpha || uniform(secondChannels)), "different color attachment blend states require the independentBlend device feature");
+        }
         blend.attachmentCount = static_cast<std::uint32_t>(firstChannels.size());
         blend.pAttachments = firstChannels.empty() ? nullptr : firstChannels.data();
         std::copy(state.blendConstants.begin(), state.blendConstants.end(), blend.blendConstants);
