@@ -5,11 +5,16 @@
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -32,6 +37,20 @@
 #define APS5_CLOSE close
 #define APS5_FILENO fileno
 #endif
+
+namespace AgcDriver::DriverDetail {
+struct DriverTestAccess {
+    static void SetDevice(std::shared_ptr<VulkanDevice> device) { Driver::Get().device = std::move(device); }
+    static void RememberReplaced(const std::shared_ptr<VulkanDevice>& device) { Driver::Get().replacedDevices.push_back(device); }
+    static std::uint32_t OpenFlipWork() { return Driver::Get().flipWorkOpen.load(std::memory_order_acquire); }
+};
+}
+
+namespace AgcDriver {
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+}
 
 namespace {
 
@@ -173,8 +192,12 @@ void testFlipAndBoundary() {
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
     auto replacement = std::make_shared<Output>();
     AgcDriverRegisterVideoOutput_nid_postfix(7, replacement);
-    submitFlip();
+    auto next = std::async(std::launch::async, [] { submitFlip(); });
+    const bool held = next.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout;
     release.Release();
+    const bool advanced = next.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    if (advanced) next.get();
+    check(held && advanced, "the next flip did not wait for the previous submission");
     AgcDriverWaitIdle_nid_postfix();
     check(output->state->ready == 1 && replacement->state->ready == 1, "registration lifetime or FIFO was lost");
     check(output->state->failed == 0, "successful request failed");
@@ -280,6 +303,258 @@ void testFlipHold() {
     AgcDriverWaitIdle_nid_postfix();
     check(output->state->ready == 6, "flips behind a later title-stored label were lost");
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+}
+
+void testFlipHoldCoversTrailingLabel() {
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    {
+        std::lock_guard lock(output->state->mutex);
+        output->state->gate = true;
+        output->state->waiting = false;
+    }
+    alignas(8) static std::atomic<std::uint32_t> label = 0;
+    label.store(0, std::memory_order_release);
+    const auto address = reinterpret_cast<std::uintptr_t>(&label);
+    std::array<std::uint32_t, 15> words{0xc004105c, 7, 0xfffffffeu, 1, 0, 0, 0xc0021018, 7, 0, 0, 0xc0033700, 0x04100200, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(static_cast<std::uint64_t>(address) >> 32u), 1};
+    Packet frame{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+    check(sceAgcDriverSubmitDcb(&frame) == 0, "flip submission with trailing label failed");
+    bool waiting = false;
+    {
+        std::unique_lock lock(output->state->mutex);
+        waiting = output->state->changed.wait_for(lock, std::chrono::seconds(5), [&] { return output->state->waiting; });
+    }
+    auto next = std::async(std::launch::async, [] { submitFlip(); });
+    const auto early = next.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
+    const auto earlyLabel = label.load(std::memory_order_acquire);
+    {
+        std::lock_guard lock(output->state->mutex);
+        output->state->gate = false;
+    }
+    output->state->changed.notify_all();
+    const auto completed = next.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    if (completed) next.get();
+    AgcDriverWaitIdle_nid_postfix();
+    const auto finalLabel = label.load(std::memory_order_acquire);
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+    check(waiting, "worker did not reach the rendering wait after flip");
+    check(!early && earlyLabel == 0, "next flip returned before the trailing label");
+    check(completed && finalLabel == 1, "trailing label or next flip did not complete");
+}
+
+void testFlipWaitsForGpuCompletion() {
+    using namespace AgcDriver;
+    auto device = std::make_shared<VulkanDevice>();
+    check(device->CanWaitUnlocked(), "GPU timeline support is required for the completion test");
+    const auto context = VulkanDeviceTestAccess::ContextOf(*device);
+    const auto createSemaphore = context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore");
+    const auto destroySemaphore = context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore");
+    auto signalSemaphore = reinterpret_cast<PFN_vkSignalSemaphore>(context.deviceProc(context.device, "vkSignalSemaphoreKHR"));
+    if (signalSemaphore == nullptr) signalSemaphore = context.Function<PFN_vkSignalSemaphore>("vkSignalSemaphore");
+    VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    check(createSemaphore(context.device, &info, nullptr, &semaphore) == VK_SUCCESS, "cannot create GPU gate");
+    struct Gate {
+        VkDevice device;
+        VkSemaphore semaphore;
+        PFN_vkSignalSemaphore signal;
+        PFN_vkDestroySemaphore destroy;
+        VulkanDevice& gpuDevice;
+        std::atomic<bool> released{false};
+        void Release() {
+            if (released.exchange(true)) return;
+            VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+            info.semaphore = semaphore;
+            info.value = 1;
+            if (signal(device, &info) != VK_SUCCESS) std::terminate();
+        }
+        ~Gate() {
+            Release();
+            try { std::lock_guard gpu(GuestMemory::GpuMutex()); gpuDevice.WaitIdle(); } catch (...) {}
+            destroy(device, semaphore, nullptr);
+        }
+    } gate{context.device, semaphore, signalSemaphore, destroySemaphore, *device};
+    DriverDetail::DriverTestAccess::SetDevice(device);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    {
+        std::lock_guard lock(output->state->mutex);
+        output->state->block = true;
+    }
+    FlipRelease release(output->state);
+    submitFlip();
+    {
+        std::unique_lock lock(output->state->mutex);
+        check(output->state->changed.wait_for(lock, std::chrono::seconds(5), [&] { return output->state->entered; }), "worker did not reach GPU test flip");
+    }
+    auto buffer = std::make_shared<Graphics::Buffer>(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::weak_ptr<Graphics::Buffer> retained = buffer;
+    std::atomic<std::uint32_t> callbackValue{0};
+    Graphics::Recorder* recorder = nullptr;
+    std::uint64_t expectedSerial = 0;
+    {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        recorder = Graphics::Recorder::Active();
+        check(recorder != nullptr, "active GPU recorder missing");
+        const auto commands = recorder->Commands();
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, buffer->Handle(), 0, 4, 0x12345678u);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder->Keep(buffer);
+        check(recorder->AfterRecordedWork([retained, &callbackValue] {
+            if (const auto data = retained.lock()) {
+                std::uint32_t value = 0;
+                std::memcpy(&value, data->Bytes().data(), sizeof(value));
+                callbackValue.store(value, std::memory_order_release);
+            }
+        }), "GPU completion callback was not recorded");
+        recorder->HoldNextSubmit(semaphore, 1);
+        expectedSerial = recorder->OpenBatchSerial();
+    }
+    buffer.reset();
+    std::atomic<bool> watchdogFired{false};
+    std::jthread watchdog([&](std::stop_token stop) {
+        for (int i = 0; i < 300 && !stop.stop_requested(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (!stop.stop_requested()) { watchdogFired.store(true); gate.Release(); }
+    });
+    auto next = std::async(std::launch::async, [] { submitFlip(); });
+    release.Release();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (recorder->NewestSubmitted() < expectedSerial && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool submitted = recorder->NewestSubmitted() >= expectedSerial;
+    auto cpuFlip = std::async(std::launch::async, [] { AgcDriverSubmitFlip_nid_postfix({7, -2, 1, 0}); });
+    const bool cpuAdvanced = cpuFlip.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready;
+    const bool held = next.wait_for(std::chrono::milliseconds(250)) == std::future_status::timeout;
+    const bool ownerHeld = !retained.expired();
+    const bool callbackPending = callbackValue.load(std::memory_order_acquire) == 0;
+    gate.Release();
+    watchdog.request_stop();
+    watchdog.join();
+    cpuFlip.get();
+    const bool advanced = next.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    if (advanced) next.get();
+    AgcDriverWaitIdle_nid_postfix();
+    const auto value = callbackValue.load(std::memory_order_acquire);
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+    DriverDetail::DriverTestAccess::SetDevice(nullptr);
+    check(submitted && cpuAdvanced && held && ownerHeld && callbackPending && !watchdogFired.load(), "GPU or CPU flip ordering around the unsignaled fence failed");
+    check(advanced && value == 0x12345678u, "flip returned before GPU write and completion callback");
+}
+
+void testFlipDeviceReplacement() {
+    using namespace AgcDriver;
+    auto oldDevice = std::make_shared<VulkanDevice>();
+    check(oldDevice->CanWaitUnlocked(), "old GPU timeline support is required");
+    const auto context = VulkanDeviceTestAccess::ContextOf(*oldDevice);
+    const auto createSemaphore = context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore");
+    const auto destroySemaphore = context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore");
+    auto signalSemaphore = reinterpret_cast<PFN_vkSignalSemaphore>(context.deviceProc(context.device, "vkSignalSemaphoreKHR"));
+    if (signalSemaphore == nullptr) signalSemaphore = context.Function<PFN_vkSignalSemaphore>("vkSignalSemaphore");
+    VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    check(createSemaphore(context.device, &info, nullptr, &semaphore) == VK_SUCCESS, "cannot create replacement gate");
+    DriverDetail::DriverTestAccess::SetDevice(oldDevice);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    std::uint64_t oldSerial = 0;
+    {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        auto* recorder = Graphics::Recorder::Active();
+        check(recorder != nullptr, "old recorder missing");
+        for (int i = 0; i < 48; ++i) {
+            recorder->Commands();
+            oldSerial = oldDevice->SubmitAndEpoch();
+        }
+        oldDevice->WaitIdle();
+        recorder->Commands();
+        recorder->HoldNextSubmit(semaphore, 1);
+        oldSerial = recorder->OpenBatchSerial();
+    }
+    submitFlip();
+    auto* oldRecorder = Graphics::Recorder::Active();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (oldRecorder->NewestSubmitted() < oldSerial && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool submitted = oldRecorder->NewestSubmitted() >= oldSerial;
+    while (DriverDetail::DriverTestAccess::OpenFlipWork() != 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool published = DriverDetail::DriverTestAccess::OpenFlipWork() == 0;
+    VkSemaphoreSignalInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+    signal.semaphore = semaphore;
+    signal.value = 1;
+    check(signalSemaphore(context.device, &signal) == VK_SUCCESS, "cannot release replacement gate");
+    AgcDriverWaitIdle_nid_postfix();
+    destroySemaphore(context.device, semaphore, nullptr);
+    std::shared_ptr<VulkanDevice> newDevice;
+    {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        oldDevice->PrepareForReplacement();
+        DriverDetail::DriverTestAccess::RememberReplaced(oldDevice);
+        newDevice = std::make_shared<VulkanDevice>();
+        DriverDetail::DriverTestAccess::SetDevice(newDevice);
+    }
+    check(newDevice->CanWaitUnlocked(), "new GPU timeline support is required");
+    auto* recorder = Graphics::Recorder::Active();
+    check(recorder != nullptr, "new recorder missing");
+    const auto newSerial = recorder->NewestSubmitted();
+    auto next = std::async(std::launch::async, [] { submitFlip(); });
+    const bool advanced = next.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready;
+    if (!advanced) {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        while (recorder->NewestSubmitted() < oldSerial) {
+            recorder->Commands();
+            newDevice->SubmitAndEpoch();
+        }
+    }
+    const bool recovered = next.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    if (recovered) next.get();
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+    {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        DriverDetail::DriverTestAccess::SetDevice(nullptr);
+        newDevice.reset();
+        oldDevice.reset();
+    }
+    check(submitted && published && oldSerial > newSerial, "replacement fixture did not separate the device serials");
+    check(advanced && recovered, "next flip waited on the old serial of the replacement device");
+}
+
+void testFlipShutdown() {
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    {
+        std::lock_guard lock(output->state->mutex);
+        output->state->gate = true;
+    }
+    std::array<std::uint32_t, 10> words{0xc004105c, 7, 0xfffffffeu, 1, 0, 0, 0xc0021018, 7, 0, 0};
+    Packet frame{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+    check(sceAgcDriverSubmitDcb(&frame) == 0, "shutdown flip submission failed");
+    bool waiting = false;
+    {
+        std::unique_lock lock(output->state->mutex);
+        waiting = output->state->changed.wait_for(lock, std::chrono::seconds(5), [&] { return output->state->waiting; });
+    }
+    auto next = std::async(std::launch::async, [] {
+        try { submitFlip(); return std::string{}; }
+        catch (const ProcessShutdown&) { return std::string("shutdown"); }
+        catch (const std::exception& error) { return std::string(error.what()); }
+    });
+    const bool held = next.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout;
+    auto shutdown = std::async(std::launch::async, [] { LibcRunShutdown_nid_postfix(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    {
+        std::lock_guard lock(output->state->mutex);
+        output->state->gate = false;
+    }
+    output->state->changed.notify_all();
+    const bool nextDone = next.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    const bool shutdownDone = shutdown.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    const auto nextResult = nextDone ? next.get() : std::string("timeout");
+    if (shutdownDone) shutdown.get();
+    check(waiting && held && nextDone && shutdownDone, "shutdown did not release held flip work");
+    check(nextResult == "shutdown" || nextResult.find("stopping") != std::string::npos, "shutdown did not cancel the held flip");
 }
 
 void testComputeRenderingWait() {
@@ -444,6 +719,23 @@ void testPresentMode() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "hold-shutdown") {
+            testFlipShutdown();
+            std::puts("AGC flip shutdown test passed");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "gpu-replacement") {
+            testFlipDeviceReplacement();
+            LibcRunShutdown_nid_postfix();
+            std::puts("AGC flip GPU replacement test passed");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "gpu-hold") {
+            testFlipWaitsForGpuCompletion();
+            LibcRunShutdown_nid_postfix();
+            std::puts("AGC flip GPU completion test passed");
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "present-mode") {
             testPresentMode();
             std::puts("present mode selection tests passed");
@@ -457,7 +749,14 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2) testReset(std::string(argv[1]) == "compute");
-        else { testFlipAndBoundary(); testFlipHold(); testComputeRenderingWait(); testComputeFlip(); testFailure(); }
+        else {
+            std::fputs("stage boundary\n", stderr); testFlipAndBoundary();
+            std::fputs("stage hold\n", stderr); testFlipHold();
+            std::fputs("stage trailing\n", stderr); testFlipHoldCoversTrailingLabel();
+            std::fputs("stage compute wait\n", stderr); testComputeRenderingWait();
+            std::fputs("stage compute flip\n", stderr); testComputeFlip();
+            std::fputs("stage failure\n", stderr); testFailure();
+        }
         const auto shutdown = expectFailure([] { LibcRunShutdown_nid_postfix(); });
         check(shutdown.find(argc == 2 ? (std::string(argv[1]) == "compute" ? "not readable" : "required shader register") : "intentional flip failure") != std::string::npos, "shutdown lost worker failure");
         std::puts("AGC flip and suspend tests passed");

@@ -9,10 +9,85 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <charconv>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace AgcDriver::Graphics {
+thread_local bool completedKeepReclaim = false;
 
 namespace {
+
+std::uint64_t CommitReserve() {
+    static const auto bytes = [] {
+        const char* value = std::getenv("APS5_COMMIT_RESERVE_MIB");
+        if (value == nullptr) return std::uint64_t{0};
+        std::uint64_t mib = 0;
+        const auto end = value + std::strlen(value);
+        const auto parsed = std::from_chars(value, end, mib);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || mib > (UINT64_MAX >> 20u)) throw std::runtime_error("invalid APS5_COMMIT_RESERVE_MIB");
+        return mib << 20u;
+    }();
+    return bytes;
+}
+
+bool CommitPressure(std::uint64_t bytes) {
+#ifdef _WIN32
+    const auto reserve = CommitReserve();
+    if (reserve == 0) return false;
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status)) throw std::runtime_error("GlobalMemoryStatusEx failed for commit pressure");
+    return status.ullAvailPageFile <= reserve || bytes > status.ullAvailPageFile - reserve;
+#else
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
+struct CommitEntry { std::uint64_t bytes; VkMemoryPropertyFlags flags; const char* operation; };
+struct CommitState {
+    std::mutex mutex;
+    std::map<std::pair<VkDevice, VkDeviceMemory>, CommitEntry> live;
+    std::uint64_t count = 0;
+    std::uint64_t allocatedBytes = 0;
+    std::uint64_t freedBytes = 0;
+};
+
+CommitState& CommitTracker() {
+    static auto* state = new CommitState;
+    return *state;
+}
+
+void CommitAllocation(VkDevice device, VkDeviceMemory memory, std::uint64_t bytes = 0, VkMemoryPropertyFlags flags = 0, const char* operation = nullptr) {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!enabled) return;
+    auto* state = &CommitTracker();
+    std::lock_guard lock(state->mutex);
+    const auto key = std::make_pair(device, memory);
+    if (bytes == 0) {
+        const auto found = state->live.find(key);
+        if (completedKeepReclaim) {
+            if (found != state->live.end()) std::fprintf(stderr, "[completed-reclaim-free] device=%p memory=%p bytes=%llu flags=%u operation=%s\n", static_cast<void*>(device), static_cast<void*>(memory), static_cast<unsigned long long>(found->second.bytes), found->second.flags, found->second.operation);
+        }
+        if (found != state->live.end()) {
+            state->freedBytes += found->second.bytes;
+            state->live.erase(found);
+        }
+        return;
+    }
+    state->live[key] = {bytes, flags, operation};
+    state->allocatedBytes += bytes;
+    if ((++state->count & 511u) != 0) return;
+    std::map<std::pair<std::string, VkMemoryPropertyFlags>, std::uint64_t> sums;
+    for (const auto& [key, entry] : state->live) sums[{entry.operation, entry.flags}] += entry.bytes;
+    std::fprintf(stderr, "[commit-vulkan] live=%zu allocated-total=%llu freed-total=%llu", state->live.size(), static_cast<unsigned long long>(state->allocatedBytes), static_cast<unsigned long long>(state->freedBytes));
+    for (const auto& [key, sum] : sums) std::fprintf(stderr, " {%s flags=%u bytes=%llu}", key.first.c_str(), key.second, static_cast<unsigned long long>(sum));
+    std::fprintf(stderr, "\n");
+}
 
 // APS5_BUFFER_POOL_SHARED=1: one tier for every size, as before the split.
 bool sharedTiers() {
@@ -39,6 +114,17 @@ constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
 
 }
 
+void ForgetCommitAllocation(VkDevice device, VkDeviceMemory memory) {
+    if (memory != VK_NULL_HANDLE) CommitAllocation(device, memory);
+}
+
+std::uint64_t TrackedCommitAllocationBytes(VkDevice device, VkDeviceMemory memory) {
+    auto& state = CommitTracker();
+    std::lock_guard lock(state.mutex);
+    const auto found = state.live.find(std::make_pair(device, memory));
+    return found != state.live.end() ? found->second.bytes : 0;
+}
+
 BufferPool::BufferPool(const Context& context) : maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 6u))), cacheReclaim(context.cacheReclaim), device(context.device), unmap(context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")), destroyBuffer(context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")), freeMemory(context.Function<PFN_vkFreeMemory>("vkFreeMemory")), allocateMemory(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")), mapMemory(context.Function<PFN_vkMapMemory>("vkMapMemory")), physical(context.physical), memoryProperties(context.memory), memoryProperties2(context.memoryProperties2) {
     smallTier.budget = smallBudget;
     largeTier.budget = budget;
@@ -59,8 +145,22 @@ BufferPool::~BufferPool() {
 }
 
 VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType, bool newImage) {
+    return allocateMemoryImpl(allocation, operation, hostType, allocatedType, newImage, false);
+}
+
+VkDeviceMemory BufferPool::allocateMemoryImpl(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType, bool newImage, bool optional) {
     if (allocatedType != nullptr) *allocatedType = allocation.memoryTypeIndex;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize proactive = 0;
+    VkDeviceSize cacheRetired = 0;
+    if (CommitPressure(allocation.allocationSize)) {
+        proactive = trim();
+        if (cacheReclaim != nullptr && CommitPressure(allocation.allocationSize)) {
+            cacheRetired = cacheReclaim(ReclaimTarget(allocation.allocationSize), newImage);
+            proactive += trim();
+        }
+        std::fprintf(stderr, "[commit-pressure] allocation=%llu pool-released=%llu cache-retired=%llu reserve=%llu\n", static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(proactive), static_cast<unsigned long long>(cacheRetired), static_cast<unsigned long long>(CommitReserve()));
+    }
     auto result = allocateMemory(device, &allocation, nullptr, &memory);
     const auto initialResult = result;
     unsigned attempts = 1;
@@ -91,6 +191,7 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         result = allocateMemory(device, &host, nullptr, &memory);
         ++attempts;
         if (result == VK_SUCCESS) {
+            CommitAllocation(device, memory, host.allocationSize, memoryProperties.memoryTypes[host.memoryTypeIndex].propertyFlags, operation);
             if (allocatedType != nullptr) *allocatedType = *hostType;
             static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
             const auto count = placements.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -100,9 +201,11 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         }
     }
     if (result == VK_SUCCESS) {
+        CommitAllocation(device, memory, allocation.allocationSize, memoryProperties.memoryTypes[allocation.memoryTypeIndex].propertyFlags, operation);
         if (attempts > 1) std::fprintf(stderr, "[bufferpool] %s recovered: allocation=%llu reclaimed=%llu released=%llu initialResult=%d attempts=%u\n", operation, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(released), static_cast<int>(initialResult), attempts);
         return memory;
     }
+    if (optional && exhausted(result)) return VK_NULL_HANDLE;
     char details[1536];
     std::snprintf(details, sizeof(details), "%s: allocation=%llu memoryType=%u reclaimed=%llu released=%llu initialResult=%d attempts=%u", operation, static_cast<unsigned long long>(allocation.allocationSize), allocation.memoryTypeIndex, static_cast<unsigned long long>(reclaimed), static_cast<unsigned long long>(released), static_cast<int>(initialResult), attempts);
     if (memoryProperties2 != nullptr && physical != VK_NULL_HANDLE) {
@@ -175,6 +278,7 @@ VkDeviceMemory BufferPool::TakeImageMemory(const VkMemoryAllocateInfo& allocatio
 void BufferPool::PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept {
     if (memory == VK_NULL_HANDLE) return;
     if (!imagePooled(bytes, memoryType)) {
+        CommitAllocation(device, memory);
         freeMemory(device, memory, nullptr);
         return;
     }
@@ -239,7 +343,15 @@ std::uint64_t BufferPool::SlabKey(std::uint32_t memoryType, std::size_t capacity
 }
 
 SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable) {
-    const auto key = SlabKey(memoryType, capacity, addressable);
+    return takeSlot(context, memoryType, capacity, addressable, false);
+}
+
+SlabSlot BufferPool::TakeImageSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity) {
+    return takeSlot(context, memoryType, capacity, false, true);
+}
+
+SlabSlot BufferPool::takeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable, bool image) {
+    const auto key = SlabKey(memoryType, capacity, addressable) | (static_cast<std::uint64_t>(image) << 38u);
     const auto takeFrom = [&](SlabBlock& block, Slab& slab) {
         const auto index = block.free.back();
         block.free.pop_back();
@@ -266,8 +378,9 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
     if (addressable) allocation.pNext = &flags;
     allocation.allocationSize = blockBytes;
     allocation.memoryTypeIndex = memoryType;
-    block->memory = AllocateMemory(allocation, "vkAllocateMemory buffer slab");
-    if ((context.memory.memoryTypes[memoryType].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+    block->memory = allocateMemoryImpl(allocation, image ? "vkAllocateMemory image slab" : "vkAllocateMemory buffer slab", std::nullopt, nullptr, image, image);
+    if (block->memory == VK_NULL_HANDLE) return {};
+    if (!image && (context.memory.memoryTypes[memoryType].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
         void* mapping = nullptr;
         const auto mapped = mapMemory(device, block->memory, 0, VK_WHOLE_SIZE, 0, &mapping);
         Check(mapped, "vkMapMemory buffer slab");
@@ -290,6 +403,7 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
 
 void BufferPool::freeBlock(SlabBlock& block) noexcept {
     if (block.mapping != nullptr) unmap(device, block.memory);
+    CommitAllocation(device, block.memory);
     freeMemory(device, block.memory, nullptr);
 }
 
@@ -361,6 +475,7 @@ VkDeviceSize BufferPool::destroy(const BufferAllocation& allocation) noexcept {
     // Device-local allocations (see DeviceBuffer) are never mapped.
     if (allocation.mapping != nullptr) unmap(device, allocation.memory);
     if (allocation.buffer != VK_NULL_HANDLE) destroyBuffer(device, allocation.buffer, nullptr);
+    CommitAllocation(device, allocation.memory);
     freeMemory(device, allocation.memory, nullptr);
     return allocation.allocationBytes;
 }
@@ -381,7 +496,22 @@ std::size_t BufferPool::NextCapacity(std::size_t capacity) {
     return capacity < classLimit ? capacity * 2 : capacity + (std::bit_floor(capacity) >> deviceClassBits);
 }
 
+namespace {
+
+std::atomic<bool> forceAddresses{false};
+
+}
+
+bool BufferPool::ForceAddresses() {
+    return forceAddresses.load(std::memory_order_relaxed);
+}
+
+void BufferPool::SetForceAddresses(bool force) {
+    forceAddresses.store(force, std::memory_order_relaxed);
+}
+
 VkBufferUsageFlags BufferPool::Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) {
+    if (ForceAddresses() && (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     return DeviceTiered(properties) ? usage | deviceUsage : usage;
 }
 
@@ -522,6 +652,8 @@ std::size_t BufferPool::MaxSlots() {
     return slots;
 }
 
+VkDeviceSize BufferPool::ReclaimUnused() { return trim(); }
+
 VkDeviceSize BufferPool::trim() {
     Tier retiredSmall;
     Tier retiredLarge;
@@ -600,6 +732,7 @@ void ReleaseImageMemory(const Context& context, VkDeviceMemory memory, VkDeviceS
         context.bufferPool->PutImageMemory(memory, bytes, memoryType);
         return;
     }
+    ForgetCommitAllocation(context.device, memory);
     context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
 }
 

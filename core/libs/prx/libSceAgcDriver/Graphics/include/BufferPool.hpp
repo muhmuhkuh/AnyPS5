@@ -15,6 +15,9 @@
 
 namespace AgcDriver::Graphics {
 
+void ForgetCommitAllocation(VkDevice device, VkDeviceMemory memory);
+std::uint64_t TrackedCommitAllocationBytes(VkDevice device, VkDeviceMemory memory);
+
 struct BufferAllocation {
     VkBuffer buffer;
     VkDeviceMemory memory;
@@ -66,21 +69,27 @@ public:
     // The size a buffer for `bytes` is created with: its size class, or `bytes` itself when large.
     static std::size_t Capacity(std::size_t bytes);
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
+    static bool ForceAddresses();
+    static void SetForceAddresses(bool force);
     VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false);
     static VkDeviceSize ImageBudget(VkDeviceSize deviceBudget);
     VkDeviceMemory TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false);
     void PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept;
     std::size_t RetainedImages();
+    VkDeviceSize ReclaimUnused();
     std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     void Put(const BufferAllocation& allocation) noexcept;
     VkDeviceSize ReclaimIdleDevice(VkDeviceSize bytes, std::chrono::steady_clock::time_point now);
     static bool SlabEligible(std::size_t capacity, VkDeviceSize alignment, VkDeviceSize size, VkDeviceSize atom);
     static VkDeviceSize SlabBlockBytes(std::size_t capacity);
     SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable);
+    SlabSlot TakeImageSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity);
     VkDeviceSize PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept;
     std::size_t SlabBlocks();
 
 private:
+    VkDeviceMemory allocateMemoryImpl(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType, std::uint32_t* allocatedType, bool newImage, bool optional);
+    SlabSlot takeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable, bool image);
     struct SlabBlock {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         std::byte* mapping = nullptr;

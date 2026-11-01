@@ -55,6 +55,30 @@ using AgcDriver::Graphics::Require;
 using AgcDriver::Graphics::StorageTexture;
 using ShaderRecompiler::ShaderStage;
 
+struct SavedBufferAccess {
+    using Type = std::shared_ptr<AgcDriver::Graphics::Buffer> StorageTexture::*;
+    friend Type SavedBuffer(SavedBufferAccess);
+};
+
+template<SavedBufferAccess::Type Member>
+struct SavedBufferMember {
+    friend SavedBufferAccess::Type SavedBuffer(SavedBufferAccess) { return Member; }
+};
+
+template struct SavedBufferMember<&StorageTexture::savedBytes>;
+
+struct CommitSaveAccess {
+    using Type = void (StorageTexture::*)(const std::vector<std::uint32_t>&);
+    friend Type CommitSave(CommitSaveAccess);
+};
+
+template<CommitSaveAccess::Type Member>
+struct CommitSaveMember {
+    friend CommitSaveAccess::Type CommitSave(CommitSaveAccess) { return Member; }
+};
+
+template struct CommitSaveMember<&StorageTexture::commitStoredSave>;
+
 constexpr std::uint32_t Threads = 32;
 constexpr std::uint32_t Side = 128;
 constexpr std::uint32_t Format8888Unorm = 56;
@@ -629,6 +653,35 @@ void RunUniformKeysBehindKernel(AgcDriver::VulkanDevice& device, std::uint8_t* b
     RequireKeys(keys, 0x00, "uniform sampled keys behind a kernel: the keys after the kernel");
 }
 
+void RunRepeatedStoredSave(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    const auto address = AddressOf(block);
+    std::memset(block, 0x55, BlockBytes);
+    auto descriptor = TextureDescriptor(block, nullptr);
+    descriptor[2] = ((Side - 1u) >> 2u) | ((2 * Side - 1u) << 14u);
+    descriptor[6] = 0;
+    descriptor[7] = 0;
+    std::vector<std::uint32_t> userData(16, 0u);
+    std::copy(descriptor.begin(), descriptor.end(), userData.begin() + 4);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Dispatch(device, WriteCode, userData);
+    const auto image = StorageTexture::FindPending(address, BlockBytes);
+    Require(image != nullptr && !AgcDriver::GuestMemory::Watched(address, BlockBytes), "repeated save requires an untracked pending storage image");
+    auto context = device.graphicsContext();
+    AgcDriver::Graphics::Recorder recorder(context);
+    recorder.Activate();
+    image->WriteBack();
+    std::weak_ptr<AgcDriver::Graphics::Buffer> first = image.get()->*SavedBuffer(SavedBufferAccess{});
+    Require(!first.expired(), "open stored save lost its GPU buffer");
+    (image.get()->*CommitSave(CommitSaveAccess{}))(std::vector<std::uint32_t>{0});
+    Require(first.lock() == image.get()->*SavedBuffer(SavedBufferAccess{}), "repeated stored save did not reuse the same buffer");
+    recorder.Sync();
+    Require(!(image.get()->*SavedBuffer(SavedBufferAccess{})), "completed captures retained the shared stored-save buffer");
+    Require(first.expired(), "executed completion capture kept its stored-save buffer");
+    Require(image->GuestSnapshotValid(), "completed repeated saves lost the comparison snapshot");
+    Require(Count(block, SurfaceBytes, 0xff) == Threads * 4u, "repeated save lost GPU results");
+    Require(Count(block + SurfaceBytes, SurfaceBytes, 0x55) == SurfaceBytes, "repeated save changed untouched bytes");
+}
+
 void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     const auto address = AddressOf(block);
     std::memset(block, 0x55, BlockBytes);
@@ -659,6 +712,8 @@ void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     Require(Count(block, SurfaceBytes, 0xff) == Threads * 4u, "refresh lost the unchanged block's GPU results");
     Require(Count(block, SurfaceBytes, 0x55) == SurfaceBytes - Threads * 4u, "refresh changed unrelated texels");
     Require(Count(block + SurfaceBytes, SurfaceBytes, 0x33) == SurfaceBytes, "write-back overwrote the CPU-edited block");
+    Require(!(image.get()->*SavedBuffer(SavedBufferAccess{})), "completed storage save retained its staging buffer beside the comparison snapshot");
+    Require(image->GuestSnapshotValid(), "retiring the completed staging buffer removed comparison bytes");
 
     Dispatch(device, WriteCode, userData);
     Require(image->Refresh(), "a freshly dispatched image did not retain its snapshot");
@@ -868,7 +923,7 @@ void RunMipmappedTarget(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
 #endif
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
         _putenv_s("APS5_PROFILE_DRAW", "1");
@@ -884,6 +939,18 @@ int main() {
         std::optional<GuestBlock> hinted;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string(argv[1]) == "repeated-stored-retention") {
+            untracked.emplace(false);
+            RunRepeatedStoredSave(*device, untracked->Data());
+            std::puts("repeated completed captures retired; pending GPU bytes and snapshots preserved");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "stored-retention") {
+            untracked.emplace(false);
+            RunUntrackedReuse(*device, untracked->Data());
+            std::puts("completed storage save retention and subsequent CPU/GPU edits passed");
+            return 0;
+        }
         block.emplace(false);
         Run(*device, block->Data());
         untracked.emplace(false);

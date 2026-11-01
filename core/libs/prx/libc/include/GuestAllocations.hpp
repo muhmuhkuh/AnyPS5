@@ -51,6 +51,7 @@ private:
     std::shared_ptr<const Ranges> ranges;
 };
 using Mapped = std::vector<std::weak_ptr<const Range>>;
+using ReplacedReport = std::function<void(const void* pointer, std::size_t bytes)>;
 
 extern "C" {
 void* GuestAllocationsBegin_nid_postfix();
@@ -69,10 +70,12 @@ bool GuestAllocationsForRegistered_nid_postfix(void* mutation, const void* point
 Range GuestAllocationsFind_nid_postfix(void* mutation, const void* pointer);
 void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer);
 void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu, const std::function<void()>& apply);
+void GuestAllocationsReplace_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu, const std::function<void(const ReplacedReport&)>& apply);
 void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply);
 Lease GuestAllocationsAcquire_nid_postfix();
 Lease GuestAllocationsAcquireMapped_nid_no_patch(const Mapped& mapped);
 Lease GuestAllocationsAcquireAll_nid_postfix();
+bool GuestAllocationsPublishIfUncontended_nid_no_patch(std::uint64_t generation, void (*publish)(void*), void* context);
 std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t address, bool next);
 // Changes whenever a mutation ends, so callers can cache facts about guest mappings between changes.
 std::uint64_t GuestAllocationsGeneration_nid_postfix();
@@ -111,6 +114,7 @@ public:
     void Remove(const void* pointer) { GuestAllocationsRemove_nid_postfix(handle, pointer); }
     void Unmap(const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply) { GuestAllocationsUnmap_nid_postfix(handle, pointer, bytes, apply); }
     void Protect(const void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu, const std::function<void()>& apply) { GuestAllocationsProtect_nid_postfix(handle, pointer, bytes, readable, writable, gpu, apply); }
+    void Replace(const void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu, const std::function<void(const ReplacedReport&)>& apply) { GuestAllocationsReplace_nid_postfix(handle, pointer, bytes, readable, writable, gpu, apply); }
     void NoteGpuMapping(const void* pointer, std::size_t bytes) { GuestAllocationsNoteGpuMapping_nid_postfix(handle, pointer, bytes); }
 
 private:

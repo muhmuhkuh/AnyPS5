@@ -152,6 +152,7 @@ void RetireShadow(VkDevice device, const HostImport& import, const std::function
 // Teardown: every shadow of the context's device is published; DestroyShadows then drops them.
 void PublishAllShadows(const Context& context, PublishReason reason);
 void DestroyShadows(VkDevice device);
+std::uint64_t ReclaimPublishedShadows(std::uint64_t bytes);
 // The [storage] line's shadow segment (10 s deltas, live slab totals).
 std::string ShadowReport();
 // APS5_SHADOW_VERIFY=1: after a shadow-sourced upload, the units read must carry no stamp newer

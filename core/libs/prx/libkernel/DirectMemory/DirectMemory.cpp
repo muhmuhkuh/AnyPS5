@@ -500,6 +500,7 @@ struct DirectMemoryState {
     std::map<std::uint64_t, PhysicalBlock> physBlocks;
     std::map<std::uint64_t, PhysicalPage> physPages;
     std::map<std::uintptr_t, DirectMapping> directMappings;
+    std::map<std::uintptr_t, std::uintptr_t> uncertainMappings;
     std::mutex protectionLock;
     std::map<std::uintptr_t, ProtectedRange> protections;
     std::mutex reservationLock;
@@ -519,6 +520,7 @@ auto& g_directLock = MemoryState().directLock;
 auto& g_physBlocks = MemoryState().physBlocks;
 auto& g_physPages = MemoryState().physPages;
 auto& g_directMappings = MemoryState().directMappings;
+auto& g_uncertainMappings = MemoryState().uncertainMappings;
 auto& g_physicalSpans = MemoryState().physicalSpans;
 auto& g_protectionLock = MemoryState().protectionLock;
 auto& g_protections = MemoryState().protections;
@@ -583,7 +585,31 @@ std::vector<std::uintptr_t> MappingsSharingPhys(std::uint64_t first, std::uint64
     return bases;
 }
 
+void ForgetUncertain(std::uintptr_t start, std::uintptr_t end) {
+    auto it = g_uncertainMappings.lower_bound(start);
+    if (it != g_uncertainMappings.begin() && std::prev(it)->second > start) --it;
+    while (it != g_uncertainMappings.end() && it->first < end) {
+        const auto base = it->first;
+        const auto limit = it->second;
+        it = g_uncertainMappings.erase(it);
+        if (base < start) g_uncertainMappings.emplace(base, start);
+        if (limit > end) it = g_uncertainMappings.emplace(end, limit).first;
+    }
+}
+
+void NoteUncertain(std::uintptr_t start, std::uintptr_t end) {
+    ForgetUncertain(start, end);
+    g_uncertainMappings.emplace(start, end);
+}
+
+bool OverlapsUncertain(std::uintptr_t start, std::uintptr_t end) {
+    const auto it = g_uncertainMappings.upper_bound(start);
+    if (it != g_uncertainMappings.begin() && std::prev(it)->second > start) return true;
+    return it != g_uncertainMappings.end() && it->first < end;
+}
+
 void EraseMappings(std::uintptr_t start, std::uintptr_t end) {
+    ForgetUncertain(start, end);
     auto it = g_directMappings.lower_bound(start);
     if (it != g_directMappings.begin() && std::prev(it)->second.end > start) --it;
     while (it != g_directMappings.end() && it->first < end) {
@@ -737,6 +763,30 @@ void AddMapping(std::uintptr_t address, std::size_t len, std::uint64_t phys, int
 #endif
 }
 
+std::vector<std::pair<std::uintptr_t, DirectMapping>> DisplacedMappings(std::uintptr_t start, std::uintptr_t end) {
+    std::vector<std::pair<std::uintptr_t, DirectMapping>> displaced;
+    auto it = g_directMappings.lower_bound(start);
+    if (it != g_directMappings.begin() && std::prev(it)->second.end > start) --it;
+    for (; it != g_directMappings.end() && it->first < end; ++it) {
+        const auto first = std::max(it->first, start);
+        const auto last = std::min(it->second.end, end);
+        displaced.emplace_back(first, DirectMapping{last, it->second.phys + (first - it->first), it->second.memoryType, it->second.nativeProtection, it->second.backing});
+    }
+    return displaced;
+}
+
+void RestoreMappings(const std::vector<std::pair<std::uintptr_t, DirectMapping>>& displaced, std::uintptr_t start, std::uintptr_t end) {
+    EraseMappings(start, end);
+    auto restored = displaced.begin();
+    try {
+        for (; restored != displaced.end(); ++restored) AddMapping(restored->first, restored->second.end - restored->first, restored->second.phys, restored->second.nativeProtection);
+    } catch (...) {
+        Trace("restore of a failed fixed remap stopped at %p", reinterpret_cast<void*>(restored->first));
+    }
+    NoteUncertain(start, end);
+    for (auto it = displaced.begin(); it != restored; ++it) ForgetUncertain(it->first, it->second.end);
+}
+
 void RequireResidentUnpinned(GuestAllocations::Mutation& mutation, std::uintptr_t address, std::size_t len) {
 #ifdef _WIN32
     std::uintptr_t start = 0;
@@ -769,6 +819,36 @@ void RequireAliasesUnpinned(GuestAllocations::Mutation& mutation, std::uint64_t 
 #endif
 }
 
+bool PhysicalSharedOutside(std::uintptr_t address, std::size_t len, std::uint64_t first, std::uint64_t last) {
+    const auto end = address + len;
+    for (const auto base : MappingsSharingPhys(first, last)) {
+        const auto& mapping = g_directMappings.at(base);
+        if (mapping.phys >= last || mapping.phys + (mapping.end - base) <= first) continue;
+        if (base < address || mapping.end > end) return true;
+    }
+    return false;
+}
+
+void ReportReplacedPhysical(std::uintptr_t address, std::size_t len, std::uint64_t phys, const GuestAllocations::ReplacedReport& replaced) {
+    const auto end = address + len;
+    for (auto cursor = address; cursor < end;) {
+        const auto following = g_directMappings.upper_bound(cursor);
+        const bool covered = following != g_directMappings.begin() && cursor < std::prev(following)->second.end;
+        std::uintptr_t next = end;
+        bool same = false;
+        if (covered) {
+            const auto current = std::prev(following);
+            next = std::min<std::uintptr_t>(end, current->second.end);
+            same = current->second.phys + (cursor - current->first) == phys + (cursor - address);
+        } else if (following != g_directMappings.end()) {
+            next = std::min<std::uintptr_t>(end, following->first);
+        }
+        if (OverlapsUncertain(cursor, next)) same = true;
+        if (!same && !PhysicalSharedOutside(address, len, phys + (cursor - address), phys + (next - address))) replaced(reinterpret_cast<const void*>(cursor), next - cursor);
+        cursor = next;
+    }
+}
+
 bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, size_t len, int prot, int flags, int64_t physStart = -1) {
     constexpr int GuestMapFixed = 0x10;
     constexpr int GuestMapNoOverwrite = 0x80;
@@ -778,7 +858,7 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
     if (physStart >= 0) RequireAliasesUnpinned(mutation, static_cast<std::uint64_t>(physStart), len);
     Trace("remap fixed %p+0x%zx prot=0x%x phys=0x%llx", addr, len, prot, static_cast<long long>(physStart));
     const auto nativeProtection = LinuxProtFromSce(prot);
-    mutation.Protect(addr, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
+    mutation.Replace(addr, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&](const GuestAllocations::ReplacedReport& replaced) {
         const auto address = reinterpret_cast<std::uintptr_t>(addr);
         std::lock_guard lock(g_directLock);
         if (physStart >= 0) {
@@ -788,7 +868,14 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
                 AddMapping(address, len, phys, nativeProtection, false);
                 return;
             }
-            AddMapping(address, len, phys, nativeProtection);
+            ReportReplacedPhysical(address, len, phys, replaced);
+            const auto displaced = DisplacedMappings(address, address + len);
+            try {
+                AddMapping(address, len, phys, nativeProtection);
+            } catch (...) {
+                RestoreMappings(displaced, address, address + len);
+                throw;
+            }
         } else {
             EraseMappings(address, address + len);
 #ifdef _WIN32
@@ -801,6 +888,7 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
             if (::mmap(addr, len, nativeProtection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "remap anonymous memory");
             GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(addr, len);
 #endif
+            replaced(addr, len);
         }
     });
     if ((prot & GuestProtGpuReadWrite) != 0) mutation.NoteGpuMapping(addr, len);

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTextureLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -207,7 +208,7 @@ struct SharedBackingScope {
 
 class TargetMemory {
 public:
-    explicit TargetMemory(std::size_t bytes, bool registerAllocation = false) : bytes(bytes), registered(registerAllocation) {
+    explicit TargetMemory(std::size_t bytes, bool registerAllocation = true) : bytes(bytes), registered(registerAllocation) {
 #ifdef _WIN32
         pointer = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536u);
         GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, PAGE_READWRITE, bytes);
@@ -255,6 +256,11 @@ public:
     }
     std::byte* Data() const { return static_cast<std::byte*>(pointer); }
     std::uint64_t Address() const { return reinterpret_cast<std::uint64_t>(pointer); }
+    void Register() {
+        Require(!registered, "fixture allocation is already registered");
+        GuestAllocations::Mutation().Add(pointer, bytes, true, true, true);
+        registered = true;
+    }
 private:
     void* pointer = nullptr;
     std::size_t bytes;
@@ -310,6 +316,12 @@ void TargetRefuses(Action action, std::string_view expected) {
     try { action(); }
     catch (const std::exception& error) { message = error.what(); }
     Require(message.find(expected) != std::string::npos, "multisample target refusal did not match " + std::string(expected) + ": " + message);
+}
+
+template<typename Action>
+void PublicationRefuses(VkFormat format, Action action) {
+    if (format == VK_FORMAT_D16_UNORM) return;
+    TargetRefuses(action, "guest publication of a written native multisample depth needs the texture detiler");
 }
 
 void QueueTargetByteWrite(const Context& context, Recorder& recorder, std::uint64_t address, std::byte value) {
@@ -509,7 +521,7 @@ std::vector<std::uint32_t> DepthFragmentShader() {
     return module.Finalize();
 }
 
-std::vector<std::uint32_t> DepthFeedbackFragmentShader(std::uint32_t binding, bool sampling) {
+std::vector<std::uint32_t> DepthFeedbackFragmentShader(std::uint32_t binding, bool sampling, float constantDepth = 0.0f) {
     ShaderRecompiler::SpirvModule module;
     module.EmitCapability(spv::CapabilityShader);
     module.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
@@ -532,7 +544,7 @@ std::vector<std::uint32_t> DepthFeedbackFragmentShader(std::uint32_t binding, bo
     const auto main = module.AllocateId();
     module.AddFunction(spv::OpFunction, voidType, main, spv::FunctionControlMaskNone, module.Type(spv::OpTypeFunction, voidType));
     module.AddFunction(spv::OpLabel, module.AllocateId());
-    auto value = module.Constant(spv::OpConstant, f32, 0u);
+    auto value = module.Constant(spv::OpConstant, f32, std::bit_cast<std::uint32_t>(constantDepth));
     if (sampling) {
         const auto element = module.AllocateId(), object = module.AllocateId(), fetched = module.AllocateId();
         value = module.AllocateId();
@@ -717,8 +729,7 @@ void CheckDrawFeedback() {
     device->Draw(state, draw, initial);
     device->WaitIdle();
     std::array<std::byte, 1> probe{};
-    TargetRefuses([&] { AgcDriver::GuestMemory::Read(depth.address, probe); }, "sample-preserving guest publication");
-    Require(DepthSurfaceAt(depth.address), "a refused guest read retired a native depth surface a draw wrote");
+    Require(DepthSurfaceAt(depth.address), "a draw left no resident native depth surface");
     reader.spirv = DepthFeedbackFragmentShader(binding, true);
     reader.variantId = 3u;
     const auto words = DepthSampleWords(depth);
@@ -750,7 +761,77 @@ void CheckDrawFeedback() {
     AgcDriver::GuestMemory::Read(tested.address + depthBytes - 1u, probe);
     Require(probe[0] == guestByte(depthBytes - 1u), "a guest read after a depth-test-only draw did not return its guest bytes");
     Require(!DepthSurfaceAt(tested.address), "a guest read left a native depth surface only depth-tested resident");
-    std::puts("Native depth feedback refused through the draw resource path; a written surface refused and a depth-tested one retired on guest read");
+    std::puts("Native depth feedback refused through the draw resource path; a depth-tested surface retired on guest read");
+}
+
+void CheckWrittenPublication(std::uint32_t samples, VkExtent2D extent, bool depthOnly, std::uint32_t pipeBankXor) {
+    const auto device = OpenVulkanTestDevice();
+    Require(device != nullptr, "native depth publication requires Vulkan");
+    const auto depthBytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, 4u, samples));
+    const auto metadataBytes = static_cast<std::size_t>(HtileMetadataBytes(extent));
+    TargetMemory memory(depthBytes), metadata(65536u);
+    std::memset(metadata.Data(), 0, 65536u);
+    const auto guestByte = [](std::size_t offset) { return static_cast<std::byte>(offset * 7u + 3u); };
+    for (std::size_t offset = 0u; offset < depthBytes; ++offset) memory.Data()[offset] = guestByte(offset);
+    DepthTarget depth{memory.Address(), 0u, extent, VK_FORMAT_D32_SFLOAT, 0.0f, 0u, metadata.Address(), false, samples};
+    depth.depthSwizzle = 24u;
+    depth.pipeBankXor = pipeBankXor;
+    depth.htileDepthOnly = depthOnly;
+    depth.iterate256 = depth.htilePipeAligned = true;
+    struct Cleanup {
+        AgcDriver::VulkanDevice& device;
+        ~Cleanup() { device.WaitIdle(); ClearCachedTextures(device.Device()); ClearDepthSurfaces(device.Device()); }
+    } cleanup{*device};
+    State state{};
+    state.stages = {ShaderPath::Vertex, 0u, 32u, 32u, std::nullopt, std::nullopt};
+    state.depth = depth;
+    state.depthTest = state.depthWrite = true;
+    state.depthCompare = VK_COMPARE_OP_ALWAYS;
+    state.renderExtent = extent;
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0f, 1.0f};
+    state.negativeOneToOne = false;
+    state.scissor = {{0, 0}, extent};
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.samples = samples;
+    ShaderRecompiler::RecompileResult vertex, producer;
+    vertex.spirv = DepthVertexShader();
+    vertex.variantId = 1u;
+    constexpr float written = 0.375f;
+    producer.spirv = DepthFeedbackFragmentShader(ShaderRecompiler::RuntimeAbi::FirstImageBinding, false, written);
+    producer.variantId = 2u;
+    const AgcDriver::Pm4::DrawParameters draw{0u, 3u, 0u, 1u, 0u, false};
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0u}, {ShaderRecompiler::ShaderStage::Fragment, &producer, PixelPushOffset(0u, device->Target())}}};
+    device->Draw(state, draw, shaders);
+    device->WaitIdle();
+    Require(DepthSurfaceAt(depth.address), "a draw left no resident native depth surface");
+    std::array<std::byte, 1> probe{};
+    AgcDriver::GuestMemory::Read(depth.address, probe);
+    Require(!DepthSurfaceAt(depth.address), "publishing a written native depth surface left it resident");
+    const MultisampleTextureLayout layout(TextureTileMode::kZ64KBX, 4u, samples, extent.width, extent.height, 1u, pipeBankXor);
+    Require(layout.Bytes() == depthBytes, "published native depth layout differs from its guarded range");
+    std::vector<bool> covered(depthBytes);
+    const auto expected = std::bit_cast<std::uint32_t>(written);
+    for (std::uint32_t y = 0u; y < extent.height; ++y) {
+        for (std::uint32_t x = 0u; x < extent.width; ++x) {
+            for (std::uint32_t sample = 0u; sample < samples; ++sample) {
+                const auto offset = static_cast<std::size_t>(layout.Offset(x, y, 0u, sample));
+                std::uint32_t value = 0u;
+                std::memcpy(&value, memory.Data() + offset, sizeof(value));
+                Require(value == expected, "a published native depth sample lost its drawn value");
+                for (std::size_t byte = 0u; byte < sizeof(value); ++byte) covered[offset + byte] = true;
+            }
+        }
+    }
+    for (std::size_t offset = 0u; offset < depthBytes; ++offset) Require(covered[offset] || memory.Data()[offset] == guestByte(offset), "publishing native depth changed guest bytes outside its samples");
+    const std::uint32_t htile = depthOnly ? 0xfffc000fu : 0xfffff00fu;
+    for (std::size_t offset = 0u; offset < metadataBytes; offset += 4u) {
+        std::uint32_t word = 0u;
+        std::memcpy(&word, metadata.Data() + offset, sizeof(word));
+        Require(word == htile, "publishing native depth did not expand its HTILE");
+    }
+    std::printf("Native depth publication samples=%u extent=%ux%u depthOnly=%u xor=0x%x: samples, HTILE and padding checked\n", samples, extent.width, extent.height, depthOnly, pipeBankXor);
 }
 
 void CheckDepthAttachmentAlias() {
@@ -794,7 +875,7 @@ void CheckStorageAliasRetirement() {
     constexpr std::uint32_t samples = 4u;
     constexpr std::size_t prefix = 65536u;
     const auto bytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, 4u, samples));
-    TargetMemory memory(prefix + bytes), metadata(65536u);
+    TargetMemory memory(prefix + bytes, false), metadata(65536u);
     std::memset(memory.Data(), 0x3c, prefix + bytes);
     std::memset(metadata.Data(), 0, 65536u);
     struct Cleanup {
@@ -814,10 +895,14 @@ void CheckStorageAliasRetirement() {
     alias.dstSelW = 5u;
     auto cached = CachedStorageSurface(context, alias);
     Require(cached != nullptr, "storage alias was not cached before native depth creation");
+    memory.Register();
     DepthTarget depth{memory.Address() + prefix, 0u, extent, VK_FORMAT_D32_SFLOAT, 0.0f, 0u, metadata.Address(), false, samples};
     depth.depthSwizzle = 24u;
     depth.iterate256 = depth.htilePipeAligned = depth.htileDepthOnly = true;
     Require(DepthSurfaceView(context, depth) != VK_NULL_HANDLE && DepthSurfaceAt(depth.address), "storage alias fixture has no native depth owner");
+    const auto depthWords = DepthSampleWords(depth);
+    auto heldDepth = DepthSurfaceTexture(context, depthWords, DecodeTextureResource(depthWords), VkComponentMapping{});
+    Require(heldDepth != nullptr, "storage alias fixture has no native sampled depth owner");
     auto disjoint = alias;
     disjoint.height = static_cast<std::uint32_t>(prefix / 1024u);
     Require(CachedStorageSurface(context, disjoint) != nullptr, "disjoint storage alias was not created");
@@ -880,7 +965,7 @@ void CheckClearDispatch() {
 void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments, bool one, bool clearing, std::optional<bool> depthOnlyOverride, ClearFault fault, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpuLock, bool iterate256 = true) {
     const VkExtent2D extent{5u, 3u};
     const auto bytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, format == VK_FORMAT_D16_UNORM ? 2u : 4u, fragments));
-    TargetMemory memory(bytes), metadata(65536u, fault == ClearFault::DriverDispatch);
+    TargetMemory memory(bytes), metadata(65536u);
     const auto metadataBytes = HtileMetadataBytes(extent);
     const bool depthOnly = depthOnlyOverride.value_or(one);
     const std::uint32_t pattern = one ? (depthOnly ? 0xfffffff0u : 0xfffc00f0u) : 0u;
@@ -909,8 +994,8 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     Require(DepthSurfaceView(context, target) == view, "native depth attachment did not reuse its image");
     NoteDepthSurfaceWrite(context, target);
     std::array<std::byte, 1> beforeSampling{};
-    TargetRefuses([&] { AgcDriver::GuestMemory::Read(target.address + bytes - 1u, beforeSampling); }, "sample-preserving guest publication");
-    TargetRefuses([&] { RequireNoMultisampleTarget(target.htileAddress + metadataBytes - 1u, 1u, "a DMA copy"); }, "sample-preserving guest publication");
+    PublicationRefuses(format, [&] { AgcDriver::GuestMemory::Read(target.address + bytes - 1u, beforeSampling); });
+    PublicationRefuses(format, [&] { RequireNoMultisampleTarget(target.htileAddress + metadataBytes - 1u, 1u, "a DMA copy"); });
     const auto words = DepthSampleWords(target);
     auto texture = CachedSampledTexture(context, words);
     auto arrayTexture = CachedSampledTexture(context, words, VK_IMAGE_VIEW_TYPE_2D_ARRAY);
@@ -1075,19 +1160,19 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     Require(std::all_of(memory.Data(), memory.Data() + bytes, [](auto value) { return value == std::byte{0xa5}; }), "native depth sampling silently published guest memory");
     std::array<std::byte, 1> probe{};
     for (const auto address : {target.address, target.address + bytes - 1u, target.htileAddress, target.htileAddress + metadataBytes - 1u}) {
-        TargetRefuses([&] { RequireNoResidentDepthRead_nid_no_patch(address, 1u); }, "sample-preserving guest publication");
-        TargetRefuses([&] { AgcDriver::GuestMemory::Read(address, probe); }, "sample-preserving guest publication");
-        TargetRefuses([&] { RequireNoMultisampleTarget(address, 1u, "a DMA copy"); }, "sample-preserving guest publication");
+        PublicationRefuses(format, [&] { RequireNoResidentDepthRead_nid_no_patch(address, 1u); });
+        PublicationRefuses(format, [&] { AgcDriver::GuestMemory::Read(address, probe); });
+        PublicationRefuses(format, [&] { RequireNoMultisampleTarget(address, 1u, "a DMA copy"); });
     }
     TargetMemory unrelated(65536u);
     AgcDriver::GuestMemory::Read(unrelated.Address(), probe);
     Require(probe[0] == std::byte{0xa5}, "resident depth guard blocked an unrelated read");
     auto alias = target;
-    alias.htileAddress += 65536u;
-    TargetRefuses([&] { DepthSurfaceView(context, alias); }, "sample-preserving guest publication");
+    alias.htileAddress = unrelated.Address();
+    if (format != VK_FORMAT_D16_UNORM) TargetRefuses([&] { DepthSurfaceView(context, alias); }, "sample-preserving guest publication");
     alias = target;
     alias.htileDepthOnly = !target.htileDepthOnly;
-    TargetRefuses([&] { DepthSurfaceView(context, alias); }, "sample-preserving guest publication");
+    if (format != VK_FORMAT_D16_UNORM) TargetRefuses([&] { DepthSurfaceView(context, alias); }, "sample-preserving guest publication");
     auto resource = DecodeTextureResource(words);
     for (std::uint32_t field = 0u; field < 18u; ++field) {
         auto changed = resource;
@@ -1166,8 +1251,8 @@ void CheckUnwrittenGuestAccess(Context context, VkFormat format, std::uint32_t f
         view = rebound;
     }
     NoteDepthSurfaceWrite(context, target);
-    TargetRefuses([&] { AgcDriver::GuestMemory::Read(target.address, probe); }, "sample-preserving guest publication");
-    TargetRefuses([&] { RequireNoMultisampleTarget(target.htileAddress, 1u, "a DMA copy"); }, "sample-preserving guest publication");
+    PublicationRefuses(format, [&] { AgcDriver::GuestMemory::Read(target.address, probe); });
+    PublicationRefuses(format, [&] { RequireNoMultisampleTarget(target.htileAddress, 1u, "a DMA copy"); });
     Require(resident(), "a refused guest access retired a written native depth surface");
     for (std::size_t offset = 0u; offset < bytes; ++offset) Require(memory.Data()[offset] == guestByte(offset), "retiring an unwritten native depth surface changed its guest bytes");
     Require(std::all_of(metadata.Data(), metadata.Data() + metadataBytes, [](std::byte value) { return value == std::byte{0}; }), "retiring an unwritten native depth surface changed its HTILE");
@@ -1376,7 +1461,7 @@ void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, st
     const auto depthBytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, format == VK_FORMAT_D16_UNORM ? 2u : 4u, samples));
     const auto metadataBytes = static_cast<std::size_t>(HtileMetadataBytes(extent));
     const auto allocationBytes = depthBytes + 65536u;
-    TargetMemory memory(allocationBytes), colorMemory(65536u);
+    TargetMemory memory(allocationBytes, false), colorMemory(65536u, false);
     const auto release = [](const void*, std::size_t, const void*, bool) {};
     const auto add = [&](TargetMemory& allocation, std::size_t bytes) {
         GuestAllocations::Mutation mutation;
@@ -1418,8 +1503,9 @@ void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, st
     color.surfaceAddress = color.address;
     Require(MultisampleTargetView(context, color) != VK_NULL_HANDLE, "retirement fixture has no color attachment");
     recorder.Sync();
-    const auto guarded = [&] {
-        TargetRefuses([&] { RequireNoResidentDepthRead_nid_no_patch(target.address, 1u); }, "sample-preserving");
+    const auto guarded = [&](bool intact = true) {
+        if (format == VK_FORMAT_D16_UNORM) return;
+        TargetRefuses([&] { RequireNoResidentDepthRead_nid_no_patch(target.htileAddress + metadataBytes - 1u, 1u); }, intact ? "guest publication of a written native multisample depth needs the texture detiler" : "requires the original complete live planes");
     };
     {
         GuestAllocations::Mutation mutation;
@@ -1443,17 +1529,17 @@ void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, st
     } else if (mode == 1u) unmap(0u, allocationBytes);
     else if (mode == 2u) {
         unmap(0u, depthBytes / 2u);
-        guarded();
+        guarded(false);
         unmap(depthBytes / 2u, depthBytes / 2u);
-        guarded();
+        guarded(false);
         unmap(depthBytes, metadataBytes / 2u);
-        guarded();
+        guarded(false);
         unmap(depthBytes + metadataBytes / 2u, metadataBytes / 2u);
     } else {
         unmap(depthBytes / 2u, depthBytes / 2u + metadataBytes / 2u);
-        guarded();
+        guarded(false);
         unmap(0u, depthBytes / 2u);
-        guarded();
+        guarded(false);
         unmap(depthBytes + metadataBytes / 2u, metadataBytes / 2u);
     }
     RequireNoResidentDepthRead_nid_no_patch(target.address, 1u);
@@ -1511,6 +1597,13 @@ int main(int argc, char** argv) {
         }
         CheckDrawFeedback();
         const auto context = device->GetContext();
+        if (argc == 1) {
+            for (const auto samples : {2u, 4u, 8u}) {
+                if (!DepthSupported(context, VK_FORMAT_D32_SFLOAT, samples)) continue;
+                CheckWrittenPublication(samples, {5u, 3u}, false, 0u);
+                CheckWrittenPublication(samples, {70u, 67u}, true, 0x8c00u);
+            }
+        }
         if (argc == 1) CheckDepthAttachmentAlias();
         if (argc == 1) CheckStorageAliasRetirement();
         std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex());

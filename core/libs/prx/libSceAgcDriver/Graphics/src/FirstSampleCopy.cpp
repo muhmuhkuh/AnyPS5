@@ -199,7 +199,10 @@ void FirstSampleCopy::release() noexcept {
     if (sampler) context.Function<PFN_vkDestroySampler>("vkDestroySampler")(context.device, sampler, nullptr);
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) {
+        ForgetCommitAllocation(context.device, memory);
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    }
     pipeline = VK_NULL_HANDLE;
     fragment = vertex = VK_NULL_HANDLE;
     framebuffer = VK_NULL_HANDLE;

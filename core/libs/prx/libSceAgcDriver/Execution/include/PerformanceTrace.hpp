@@ -26,6 +26,13 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace AgcDriver {
 class TraceThread;
 }
@@ -183,7 +190,7 @@ public:
     inline static const std::atomic<bool> AlwaysBuffering{true};
 
     TraceThread(std::string name, const std::atomic<std::uint64_t>& presents, std::size_t capacity = DefaultCapacity, const std::atomic<bool>& buffering = AlwaysBuffering)
-        : name(std::move(name)), presents(presents), buffering(buffering), slices(std::make_unique<Slice[]>(capacity)), capacity(capacity) {}
+        : name(std::move(name)), presents(presents), buffering(buffering), slices(capacity), capacity(capacity) {}
 
     TraceThread(const TraceThread&) = delete;
     TraceThread& operator=(const TraceThread&) = delete;
@@ -219,6 +226,51 @@ public:
     }
 
 private:
+    class SliceStorage {
+    public:
+#ifdef _WIN32
+        explicit SliceStorage(std::size_t capacity) {
+            if (capacity > std::numeric_limits<std::size_t>::max() / sizeof(Slice)) throw std::bad_array_new_length();
+            SYSTEM_INFO info{};
+            GetSystemInfo(&info);
+            pageBytes = info.dwPageSize;
+            if (capacity == 0) return;
+            data = static_cast<Slice*>(VirtualAlloc(nullptr, capacity * sizeof(Slice), MEM_RESERVE, PAGE_READWRITE));
+            if (data == nullptr) throw std::bad_alloc();
+        }
+
+        ~SliceStorage() {
+            if (data != nullptr) VirtualFree(data, 0, MEM_RELEASE);
+        }
+
+        Slice* get() const { return data; }
+
+        void Store(std::size_t index, const Slice& slice) {
+            const auto end = (index + 1) * sizeof(Slice);
+            if (end > committedBytes) {
+                const auto remaining = end - committedBytes;
+                const auto bytes = ((remaining - 1) / pageBytes + 1) * pageBytes;
+                if (VirtualAlloc(reinterpret_cast<std::byte*>(data) + committedBytes, bytes, MEM_COMMIT, PAGE_READWRITE) == nullptr)
+                    throw std::bad_alloc();
+                committedBytes += bytes;
+            }
+            std::construct_at(data + index, slice);
+        }
+
+    private:
+        Slice* data = nullptr;
+        std::size_t pageBytes = 0;
+        std::size_t committedBytes = 0;
+#else
+        explicit SliceStorage(std::size_t capacity) : data(std::make_unique<Slice[]>(capacity)) {}
+        Slice* get() const { return data.get(); }
+        void Store(std::size_t index, const Slice& slice) { data[index] = slice; }
+
+    private:
+        std::unique_ptr<Slice[]> data;
+#endif
+    };
+
     struct Entry {
         std::atomic<const char*> scope{nullptr};
         std::atomic<const char*> stage{nullptr};
@@ -234,7 +286,7 @@ private:
             lost.store(count + 1, std::memory_order_release);
             return;
         }
-        slices[index] = slice;
+        slices.Store(index, slice);
         used.store(index + 1, std::memory_order_release);
     }
 
@@ -260,7 +312,7 @@ private:
     const std::string name;
     const std::atomic<std::uint64_t>& presents;
     const std::atomic<bool>& buffering;
-    const std::unique_ptr<Slice[]> slices;
+    SliceStorage slices;
     const std::size_t capacity;
     std::atomic<std::size_t> used{0};
     std::atomic<std::uint64_t> lost{0};

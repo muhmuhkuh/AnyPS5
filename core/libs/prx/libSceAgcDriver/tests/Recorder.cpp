@@ -13,7 +13,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -79,11 +81,23 @@
 #include <optional>
 #include <random>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+namespace AgcDriver::Graphics {
+struct StagingLifetimeFixture {
+    static std::weak_ptr<Buffer> Staged(const ShaderResources& resources, std::uint64_t address) {
+        for (const auto& region : resources.guestMemory.regions) {
+            if (region.begin <= address && address < region.end && region.deviceLocal && region.gpuCopy) return region.buffer;
+        }
+        return {};
+    }
+};
+}
 
 namespace {
 
@@ -3966,6 +3980,191 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+class StagingFreeProbe {
+public:
+    explicit StagingFreeProbe(Context& poolContext) : resolver(poolContext.deviceProc) {
+        Require(active == nullptr, "nested staging free probe");
+        active = this;
+        poolContext.deviceProc = resolve;
+    }
+    ~StagingFreeProbe() { active = nullptr; }
+    bool Freed(VkDeviceMemory memory) const {
+        std::lock_guard lock(mutex);
+        return freed.contains(memory);
+    }
+    void Reset() {
+        std::lock_guard lock(mutex);
+        freed.clear();
+    }
+
+private:
+    static VKAPI_ATTR void VKAPI_CALL freeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* callbacks) {
+        auto* probe = active;
+        reinterpret_cast<PFN_vkFreeMemory>(probe->resolver(device, "vkFreeMemory"))(device, memory, callbacks);
+        std::lock_guard lock(probe->mutex);
+        probe->freed.insert(memory);
+    }
+    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL resolve(VkDevice device, const char* name) {
+        if (std::strcmp(name, "vkFreeMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(freeMemory);
+        return active->resolver(device, name);
+    }
+    PFN_vkGetDeviceProcAddr resolver;
+    mutable std::mutex mutex;
+    std::set<VkDeviceMemory> freed;
+    static inline StagingFreeProbe* active = nullptr;
+};
+
+bool stagingCacheLifetimeTests(const Device& device, Recorder& recorder) {
+#ifdef _WIN32
+    std::array<wchar_t, 32768> modulePath{};
+    const auto module = GetModuleHandleW(L"libSceAgcDriver.prx");
+    const auto pathLength = module != nullptr ? GetModuleFileNameW(module, modulePath.data(), static_cast<DWORD>(modulePath.size())) : 0;
+    Require(pathLength != 0 && pathLength < modulePath.size(), "staging driver module path unavailable");
+    std::array<wchar_t, 32768> expectedPath{};
+    const auto expectedLength = GetEnvironmentVariableW(L"APS5_TEST_AGC_DRIVER_PATH", expectedPath.data(), static_cast<DWORD>(expectedPath.size()));
+    if (expectedLength != 0) Require(expectedLength < expectedPath.size() && _wcsicmp(modulePath.data(), expectedPath.data()) == 0, "staging test loaded a different AGC driver");
+    std::wcout << L"staging-driver=" << modulePath.data() << L'\n';
+#endif
+    auto context = device.GetContext();
+    if (context.hostImportAlignment == 0) return false;
+    constexpr std::size_t bytes = 4u << 20u;
+    constexpr std::size_t elementBytes = 64u << 10u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate staging lifetime block");
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const auto element = address + 8192;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    Require(HostImportFor(context, address, bytes) != nullptr, "staging lifetime import unavailable");
+    auto poolContext = context;
+    StagingFreeProbe probe(poolContext);
+    context.bufferPool = std::make_shared<BufferPool>(poolContext);
+    auto& cache = SharedResourceCache();
+    Require(cache.Size() == 0, "staging pressure cache is not empty");
+    const ResourceCache::Key key{0x1234};
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(element), (static_cast<std::uint32_t>(element >> 32u) & 0xffffu) | (16u << 16u), elementBytes / 16u, 0x31000000u};
+    binding.bufferWritten = {true};
+    binding.bufferRead = {true};
+    binding.bufferAtomic = {false};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_shared<ShaderResources>(context, compute, std::span<const GuestMemorySnapshot>{}, false, elementBytes / 16u);
+    std::weak_ptr<ShaderResources> build = resources;
+    auto staged = StagingLifetimeFixture::Staged(*resources, element);
+    Require(!staged.expired(), "staging lifetime did not produce a device-local shadow");
+    VkBuffer handle = VK_NULL_HANDLE;
+    BufferBacking backing{};
+    {
+        auto buffer = staged.lock();
+        handle = buffer->Handle();
+        backing = buffer->Backing();
+    }
+    Require(backing.memory != VK_NULL_HANDLE && !backing.slab && backing.bytes >= elementBytes, "staging lifetime has no distinct allocation");
+    cache.Insert(key, resources);
+    Require(cache.Find(key).get() == resources.get(), "staging lifetime cache missed its build");
+    const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+    const auto check = [&](std::uint8_t value) {
+        const auto* data = static_cast<const std::uint8_t*>(block);
+        for (std::size_t i = 0; i < bytes; ++i) {
+            const auto expected = i >= 8192 + 256 && i < 8192 + 320 ? value : 0x11;
+            Require(data[i] == expected, "staging copy-back changed unexpected guest bytes");
+        }
+    };
+    const auto record = [&](const std::shared_ptr<ShaderResources>& use, std::uint32_t value) {
+        const auto commands = recorder.Commands();
+        fill(commands, handle, 256, 64, value);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        use->MarkGpuWrites(recorder);
+        recorder.Keep(use);
+    };
+    record(resources, 0x22222222u);
+    const auto openSerial = recorder.OpenSerial();
+    const auto openReleased = ReleaseTextureCaches(backing.bytes);
+    context.bufferPool->ReclaimUnused();
+    Require(cache.Find(key).get() == resources.get() && !probe.Freed(backing.memory), "pressure released an open staging build");
+    std::cout << "staging-pressure open=" << openSerial << " completed=" << recorder.CompletedThrough() << " cache=1 freed=0 reported=" << openReleased << '\n';
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    check(0x22);
+    Require(recorder.CompletedThrough() >= openSerial, "active staging build did not complete");
+    const auto activeReleased = ReleaseTextureCaches(backing.bytes);
+    context.bufferPool->ReclaimUnused();
+    Require(cache.Find(key).get() == resources.get() && !probe.Freed(backing.memory), "pressure released an actively used build");
+    std::cout << "staging-pressure active-completed=" << recorder.CompletedThrough() << " cache=1 freed=0 reported=" << activeReleased << '\n';
+    resources.reset();
+    const auto releaseDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while ((build.use_count() != 1 || staged.use_count() != 1) && std::chrono::steady_clock::now() < releaseDeadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Require(build.use_count() == 1 && staged.use_count() == 1 && recorder.CompletedThrough() >= openSerial, "staging build is not cache-only after completion");
+    const auto pressureMemory = backing.memory;
+    const auto pressureBytes = backing.bytes;
+    const auto pressureReleased = ReleaseTextureCaches(pressureBytes);
+    const auto pressurePool = context.bufferPool->ReclaimUnused();
+    const bool pressureCached = cache.Find(key) != nullptr;
+    const bool pressureFreed = probe.Freed(pressureMemory);
+    std::cout << "staging-pressure completed=" << recorder.CompletedThrough() << " memory=" << pressureMemory << " bytes=" << pressureBytes << " cache=" << pressureCached << " buffer-owners=" << staged.use_count() << " expired=" << staged.expired() << " driver-free=" << pressureFreed << " reported=" << pressureReleased << " pool-reclaimed=" << pressurePool << '\n';
+    const bool expectRelease = std::getenv("APS5_TEST_EXPECT_PRESSURE_RELEASE") != nullptr;
+    if (expectRelease) {
+        Require(!pressureCached && staged.expired() && pressureFreed, "pressure retained a completed cache-only staging build");
+        probe.Reset();
+        resources = std::make_shared<ShaderResources>(context, compute, std::span<const GuestMemorySnapshot>{}, false, elementBytes / 16u);
+        cache.Insert(key, resources);
+        build = resources;
+        staged = StagingLifetimeFixture::Staged(*resources, element);
+        {
+            auto buffer = staged.lock();
+            Require(buffer != nullptr, "control build has no staging buffer");
+            handle = buffer->Handle();
+            backing = buffer->Backing();
+        }
+        resources.reset();
+    } else {
+        Require(pressureCached && !staged.expired() && !pressureFreed, "baseline pressure unexpectedly released the staging build");
+    }
+    resources = cache.Find(key);
+    Require(resources != nullptr && resources->Revalidate(compute), "staging cache build did not revalidate");
+    auto same = StagingLifetimeFixture::Staged(*resources, element);
+    Require(!same.owner_before(staged) && !staged.owner_before(same), "staging cache reuse changed the shadow");
+    record(resources, 0x33333333u);
+    const auto serial = recorder.OpenSerial();
+    cache.Remove(key, resources.get());
+    resources.reset();
+    Require(cache.Find(key) == nullptr && recorder.Recording(), "staging build was not removed during open work");
+    context.bufferPool->ReclaimUnused();
+    Require(!staged.expired() && !probe.Freed(backing.memory), "open staging work lost its allocation");
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    Require(recorder.CompletedThrough() >= serial, "staging batch did not complete");
+    check(0x33);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!staged.expired() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::cout << "staging completion=" << serial << " buffer-owners=" << staged.use_count() << " build-owners=" << build.use_count() << '\n';
+    Require(staged.expired(), "completed staging buffer remains owned");
+    const auto reclaimed = context.bufferPool->ReclaimUnused();
+    Require(probe.Freed(backing.memory), "staging allocation did not reach vkFreeMemory");
+    std::cout << "staging lifetime memory=" << backing.memory << " bytes=" << backing.bytes << " completed=" << serial << " reclaimed=" << reclaimed << " driver-free=1\n";
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    context.bufferPool.reset();
+    return true;
+}
+
 bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -7705,6 +7904,46 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
         recorder.Sync();
     }
     recorder.Sync();
+    {
+        std::memset(keys, 0xff, keyCount);
+        const auto meta = resource.dccAddress >> 8u;
+        const std::vector<std::uint32_t> words{
+            static_cast<std::uint32_t>(address >> 8u),
+            static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((side - 1u) & 3u) << 30u),
+            ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+            0xfacu | (0x1bu << 20u) | (9u << 28u),
+            0u,
+            0u,
+            (1u << 19u) | (1u << 20u) | (1u << 21u) | (static_cast<std::uint32_t>(meta & 0xffu) << 24u),
+            static_cast<std::uint32_t>(meta >> 8u),
+        };
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding images{ShaderRecompiler::DescriptorKind::StorageImage, ShaderRecompiler::DescriptorRole::GuestImages, 0, ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding, 1, words};
+        images.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+        images.imageWritten = {true};
+        program.bindings.push_back(images);
+        const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        const PlaceholderImages placeholders(context);
+        auto imageContext = context;
+        imageContext.placeholderImages = &placeholders;
+        std::lock_guard gpu(GpuMutex());
+        ShaderResources resources(imageContext, compute);
+        Require(resources.Reusable(), "a set writing a keyed storage image is not kept for reuse");
+        ShaderResources::ProofReport report;
+        Require(resources.Revalidate(std::span(&compute, 1), &report), "a set over an unchanged keyed storage image did not revalidate");
+        Require(resources.Revalidate(std::span(&compute, 1), &report) && report.path == ShaderResources::ProofPath::Fast, "a set over an unchanged keyed storage image left the fast proof");
+        const auto image = StorageTexture::FindLive(address, surfaceBytes);
+        Require(image != nullptr && image->UploadedKeys() == DccKeys::Uncompressed, "the storage image was not uploaded under uncompressed keys");
+        std::memset(keys, 0x00, keyCount);
+        Require(resources.Revalidate(std::span(&compute, 1), &report), "a set over a fast-cleared keyed storage image did not revalidate");
+        Require(report.path == ShaderResources::ProofPath::OwnRefreshed, "a fast clear of a storage image's keys took the full walk instead of the image's own refresh");
+        Require(image->UploadedKeys() != DccKeys::Uncompressed, "the own refresh did not apply the fast clear");
+        Require(resources.Revalidate(std::span(&compute, 1), &report) && report.path == ShaderResources::ProofPath::Fast, "the set did not return to the fast proof after the fast clear");
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        ClearCachedTextures(context.device);
+    }
 }
 
 void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
@@ -12443,6 +12682,11 @@ int main(int argc, char** argv) {
             unchangedCpuStampTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--refresh-proofs-only") {
+            refreshProofTests(device, recorder);
+            std::cout << "refresh proof tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--idle-writeback-race-only") {
             idleWriteBackRaceTests(device, recorder);
             return 0;
@@ -12485,6 +12729,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--bda-staging-only") {
+            if (std::getenv("APS5_TEST_STAGING_LIFETIME") != nullptr) return stagingCacheLifetimeTests(device, recorder) ? 0 : 77;
             if (!bdaStagingTests(device, recorder)) return 77;
             std::cout << "address-based staging tests passed\n";
             return 0;

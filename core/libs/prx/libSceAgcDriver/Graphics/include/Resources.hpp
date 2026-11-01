@@ -6,6 +6,14 @@
 
 namespace AgcDriver::Graphics {
 
+struct BufferBacking {
+    VkDeviceMemory memory;
+    VkDeviceSize offset;
+    VkDeviceSize bytes;
+    std::size_t capacity;
+    bool slab;
+};
+
 class Buffer {
 public:
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -17,7 +25,9 @@ public:
     // Host-visible buffers only: a device-local one (properties without HOST_VISIBLE, the staging
     // shadows of GuestBufferMemory) has no mapping and its bytes move by GPU copies alone.
     std::span<std::byte> Bytes();
+    BufferBacking Backing() const { return {memory, offset, allocationBytes, capacity, slab}; }
     bool Mapped() const { return mapping != nullptr; }
+    bool SnapshotUploadCompatible() const { return mapping != nullptr && (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0; }
     void Invalidate();
 
 private:
@@ -52,6 +62,7 @@ public:
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
     VkBuffer Handle() const;
     std::size_t Size() const;
+    BufferBacking Backing() const { return {memory, 0, allocationBytes, capacity, false}; }
 
 private:
     void release() noexcept;

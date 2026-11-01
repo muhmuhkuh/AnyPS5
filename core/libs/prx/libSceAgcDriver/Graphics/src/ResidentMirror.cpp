@@ -84,7 +84,11 @@ public:
 
     ~ResidentMemory() {
         const auto freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
-        for (auto& slab : slabs) freeMemory(context.device, slab->memory, nullptr);
+        for (auto& slab : slabs) {
+            ForgetCommitAllocation(context.device, slab->memory);
+            freeMemory(context.device, slab->memory, nullptr);
+        }
+        ForgetCommitAllocation(context.device, zero);
         freeMemory(context.device, zero, nullptr);
     }
 
@@ -132,6 +136,7 @@ public:
         slab->free.push_back(index);
         if (slab->free.size() != SlabBlocks) return;
         const auto found = std::find_if(slabs.begin(), slabs.end(), [&](const auto& held) { return held.get() == slab; });
+        ForgetCommitAllocation(context.device, slab->memory);
         context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, slab->memory, nullptr);
         slabs.erase(found);
     }

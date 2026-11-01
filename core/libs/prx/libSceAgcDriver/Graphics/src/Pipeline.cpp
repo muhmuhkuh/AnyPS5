@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -25,10 +26,36 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
 
 namespace AgcDriver::Graphics {
 
 namespace {
+
+struct PipelineBuildProfile {
+    bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::chrono::steady_clock::time_point lap = std::chrono::steady_clock::now();
+    std::size_t previous = PrivateBytes();
+    static std::size_t PrivateBytes() {
+#ifdef _WIN32
+        PROCESS_MEMORY_COUNTERS_EX counters{};
+        counters.cb = sizeof(counters);
+        if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters))) return counters.PrivateUsage;
+#endif
+        return 0;
+    }
+    void Mark(const char* phase, std::size_t words, bool libraries, bool heap) {
+        if (!enabled) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto bytes = PrivateBytes();
+        std::fprintf(stderr, "[graphics-build] %s ms=%.3f words=%zu libraries=%u heap=%u private=%zu delta=%lld\n", phase, std::chrono::duration<double, std::milli>(now - lap).count(), words, libraries ? 1u : 0u, heap ? 1u : 0u, bytes, static_cast<long long>(bytes) - static_cast<long long>(previous));
+        lap = now;
+        previous = bytes;
+    }
+};
 
 bool LogicOpFormat(VkFormat format) {
     switch (format) {
@@ -342,11 +369,22 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
         appendKey(key, shader.pushConstantOffset);
         if (resources.split) {
             auto& sets = shader.stage == Stage::Fragment ? keys.fragmentSets : keys.preRasterizationSets;
-            for (const auto& binding : shader.program->bindings) {
-                Require(binding.descriptorSet < 2u, "split pipeline library descriptor set exceeds two slots");
-                sets |= 1u << binding.descriptorSet;
+            if (shader.program->gpuResolvedImages) {
+                sets |= 2u;
+                for (const auto& binding : shader.program->bindings) {
+                    if (binding.descriptorSet == 0u) sets |= 1u;
+                }
+            } else {
+                for (const auto& binding : shader.program->bindings) {
+                    Require(binding.descriptorSet < 2u, "split pipeline library descriptor set exceeds two slots");
+                    sets |= 1u << binding.descriptorSet;
+                }
             }
         }
+    }
+    if (resources.split && std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program->gpuResolvedImages; })) {
+        keys.preRasterizationSets |= 2u;
+        keys.fragmentSets |= 2u;
     }
     if (resources.split) {
         const auto unused = 3u & ~(keys.preRasterizationSets | keys.fragmentSets);
@@ -436,6 +474,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
             appendKey(key, resources.fragmentKey.size());
             for (const auto word : resources.fragmentKey) appendKey(key, word);
         }
+        if ((sets & 4u) != 0u) appendKey(key, 0x44415441u);
     };
     splitKey(keys.layout, 3u);
     splitKey(keys.preRasterizationLayout, keys.preRasterizationSets);
@@ -449,6 +488,9 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
 
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias), dynamicRendering(context.graphicsPipelineLibrary) {
     PerformanceTimer timing("Vulkan.GraphicsPipeline");
+    PipelineBuildProfile buildProfile;
+    std::size_t sourceWords = 0;
+    for (const auto& shader : shaders) sourceWords += shader.program->spirv.size();
     for (const auto& color : state.colors) boundAttachments.push_back(color.partialWriteMask == 0u);
     if (state.depth) boundAttachments.push_back(true);
     sampleLocationsEnabled = ValidateSampleLocations(context, state);
@@ -499,6 +541,18 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         std::vector<VkPipelineShaderStageCreateInfo> stages(shaders.size());
         std::vector<PipelineSpecialization> specializations;
         specializations.reserve(shaders.size());
+        std::vector<std::vector<VkDescriptorSetAndBindingMappingEXT>> heapMappings(shaders.size());
+        std::vector<VkShaderDescriptorSetAndBindingMappingInfoEXT> heapMappingInfos(shaders.size(), VkShaderDescriptorSetAndBindingMappingInfoEXT{VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT});
+        if (context.descriptorHeap && DescriptorHeapEnabled() && std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program->gpuResolvedImages; })) {
+            auto& heap = BindlessHeap::For(context);
+            const bool rooted = std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program->dataAddressPush; });
+            descriptorHeap = std::all_of(shaders.begin(), shaders.end(), [&](const CompiledShader& shader) {
+                const auto index = static_cast<std::size_t>(&shader - shaders.data());
+                const bool generatedFault = !shader.program->gpuResolvedImages && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer; });
+                return heap.DescriptorHeapMappings(std::span<const std::uint32_t>(shader.program->spirv.data(), shader.program->spirv.size()), heapMappings[index], ~0u, shader.program->dataAddressPush, generatedFault && rooted, shader.program->functionLdsBuffer, shader.program->meshWindowBuffer);
+            });
+        }
+        Require(descriptorHeap || std::none_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program->gpuResolvedImages; }), "a pipeline with GPU-mode stages does not map onto VK_EXT_descriptor_heap");
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT meshSubgroup{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT, nullptr, 32u};
         for (std::uint32_t i = 0; i < shaders.size(); ++i) {
             const auto& shader = *shaders[i].program;
@@ -509,13 +563,19 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             stages[i].module = _modules[i];
             stages[i].pName = "main";
             if (shaders[i].stage == ShaderRecompiler::ShaderStage::Mesh && context.meshWave32 && shader.hostSubgroupSize == 32u) stages[i].pNext = &meshSubgroup;
+            if (descriptorHeap) {
+                heapMappingInfos[i].mappingCount = static_cast<std::uint32_t>(heapMappings[i].size());
+                heapMappingInfos[i].pMappings = heapMappings[i].data();
+                heapMappingInfos[i].pNext = stages[i].pNext;
+                stages[i].pNext = &heapMappingInfos[i];
+            }
             specializations.emplace_back(shader);
             stages[i].pSpecializationInfo = specializations.back().Info();
         }
         if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); })) {
             for (std::size_t i = 0; i < shaders.size(); ++i) {
                 if (shaders[i].stage != ShaderRecompiler::ShaderStage::Vertex) continue;
-                Require(stages[i].flags == 0u && stages[i].pNext == nullptr, "stencil replay vertex stage allows varying subgroup size");
+                Require(stages[i].flags == 0u && (stages[i].pNext == nullptr || stages[i].pNext == &heapMappingInfos[i]), "stencil replay vertex stage allows varying subgroup size");
             }
         }
         // A descriptor set layout with the same bindings as this one is compatible with the pipeline
@@ -527,12 +587,12 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         const VkPushConstantRange push{pushStages, 0, PipelinePushSlotBytes};
         const std::array<VkPushConstantRange, 2> slots{{{pushStagesOf(context), 0, PipelinePushSlotBytes}, {VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes}}};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layoutInfo.flags = pixelLds || meshWindow || !resources.split ? 0 : VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT;
+        layoutInfo.flags = !pixelLds && !meshWindow && resources.split && context.graphicsPipelineLibrary ? VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT : 0;
         layoutInfo.setLayoutCount = meshWindow ? 4u : pixelLds ? 3u : resources.split ? 2u : 1u;
         layoutInfo.pSetLayouts = setLayouts.data();
         layoutInfo.pushConstantRangeCount = dynamicRendering ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = dynamicRendering ? slots.data() : pushStages != 0 ? &push : nullptr;
-        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout graphics");
+        if (!descriptorHeap) Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout graphics");
         std::vector<VkAttachmentDescription> colors;
         std::vector<VkAttachmentReference> references(state.blends.size(), VkAttachmentReference{VK_ATTACHMENT_UNUSED, attachmentLayout});
         for (std::uint32_t index = 0; index < state.colors.size(); ++index) {
@@ -725,7 +785,16 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         pipelineInfo.layout = layout;
         pipelineInfo.renderPass = renderPass;
         if (dynamicRendering) pipelineInfo.pNext = &rendering;
+        VkPipelineCreateFlags2CreateInfoKHR heapFlags{VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR};
+        if (descriptorHeap) {
+            heapFlags.flags = static_cast<VkPipelineCreateFlags2KHR>(pipelineInfo.flags) | VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
+            heapFlags.pNext = pipelineInfo.pNext;
+            pipelineInfo.pNext = &heapFlags;
+            pipelineInfo.flags = 0;
+            pipelineInfo.layout = VK_NULL_HANDLE;
+        }
         timing.Mark("modules_and_state");
+        buildProfile.Mark("modules-state", sourceWords, libraries, descriptorHeap);
         if (prebuilding && !libraries) {
             for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
             _modules.clear();
@@ -757,6 +826,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         _modules.clear();
         timing.Mark("create");
+        buildProfile.Mark("create-release", sourceWords, libraries, descriptorHeap);
         PerformanceCounters::CountPipeline();
         LogPipelineStatistics_nid_no_patch(context, pipeline);
     } catch (...) {
@@ -975,12 +1045,17 @@ void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state) c
 
 void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
     if (stages == 0) return;
-    if (dynamicRendering) {
-        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, pushStagesOf(context), 0, PipelinePushSlotBytes, bytes.data());
-        context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes, bytes.data() + PipelinePushSlotBytes);
+    if (descriptorHeap) {
+        const VkPushDataInfoEXT push{VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT, nullptr, 0, {bytes.data(), bytes.size()}};
+        context.Function<PFN_vkCmdPushDataEXT>("vkCmdPushDataEXT")(commands, &push);
         return;
     }
-    context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, stages, 0, PipelinePushSlotBytes, bytes.data());
+    if (dynamicRendering) {
+        CmdPushConstants(context, commands, layout, pushStagesOf(context), 0, PipelinePushSlotBytes, bytes.data());
+        CmdPushConstants(context, commands, layout, VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes, bytes.data() + PipelinePushSlotBytes);
+        return;
+    }
+    CmdPushConstants(context, commands, layout, stages, 0, PipelinePushSlotBytes, bytes.data());
 }
 
 namespace {

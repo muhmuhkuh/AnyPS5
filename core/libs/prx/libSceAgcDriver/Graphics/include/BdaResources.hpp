@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "Recompiler.hpp"
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,6 +18,7 @@ public:
     explicit BdaResources(const Context& context);
     BdaResources(const Context& context, const GuestBufferMemory& memory);
     VkDescriptorBufferInfo Table() const;
+    bool TableGuardCurrent(VkDevice device, std::span<const ShaderRecompiler::BdaAbi::Range> ranges);
     VkDescriptorBufferInfo Fault() const;
     void CheckFault() const;
     struct ImageTableFaults {
@@ -37,8 +39,6 @@ public:
         std::uint64_t hits = 0;
         std::uint64_t misses = 0;
         std::size_t held = 0;
-        // Hits served by the cached address space's serial alone (no hash, no compare; see
-        // GuestBufferMemory::CachedAddressTable), counted in `hits` too.
         std::uint64_t spaceTables = 0;
         // Why the most recently used table did not serve a build ([bda-table] first-differing entry
         // class): its owners were gone (expired weak reference), or its word hash differed, split by
@@ -62,6 +62,7 @@ private:
     std::shared_ptr<Buffer> table;
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
+    std::uint64_t tableGuardSerial = 0;
     std::vector<ImageTableFaults> imageTables;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
     std::vector<SrtGuardFaults> srtGuards;

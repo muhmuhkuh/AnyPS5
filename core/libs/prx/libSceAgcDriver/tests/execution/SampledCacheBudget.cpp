@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -584,6 +586,40 @@ void viewTests(const Context& context) {
     Require(heldView.expired() && heldStorage.expired(), "the evicted image outlived its last caller without a sampled lookup");
 }
 
+bool heapViewTests(const Context& context) {
+    if (!GpuHeapEnabled() || !context.descriptorHeap || context.hostImportAlignment == 0) return false;
+    Block block(context);
+    if (HostImportFor(context, block.Surface(0), BlockBytes) == nullptr) return false;
+    auto view = Sampled(context, block.Surface(0));
+    Require(view->ViewsStorageImage(), "a sampled texture in host-imported memory is not a view of its storage image");
+    const std::weak_ptr<Texture> viewed = view;
+    for (std::size_t surface = 1; surface < Surfaces; ++surface) CachedStorageSurface(context, Resource(block.Surface(surface)));
+    Require(!view->StorageSource()->Cached(), "the heap view's storage image was not evicted");
+    auto& heap = BindlessHeap::For(context);
+    Require(heap.TextureSlot(ShaderRecompiler::RuntimeAbi::FirstImageBinding, view, view->View(), view->Layout()).has_value(), "the view of an evicted storage image took no heap slot");
+    view.reset();
+    Require(!viewed.expired(), "the heap slot did not hold the view of the evicted storage image");
+    BindlessHeap::SweepIfDue();
+    Require(viewed.expired(), "the present after the heap became the only holder of a view of an evicted storage image kept the view, and with it the image");
+    return true;
+}
+
+void heapHeldReleaseTests(const Context& context) {
+    Block block(context);
+    auto& heap = BindlessHeap::For(context);
+    std::vector<std::weak_ptr<Texture>> held;
+    for (std::size_t surface = 0; surface < 2; ++surface) {
+        auto texture = Sampled(context, block.Surface(surface));
+        Require(heap.TextureSlot(ShaderRecompiler::RuntimeAbi::FirstImageBinding, texture, texture->View(), texture->Layout()).has_value(), "the cached sampled texture took no heap slot");
+        held.push_back(texture);
+    }
+    Require(TextureCacheUsage().sampledEntries == 2u, "the two sampled textures were not cached");
+    Require(!held[0].expired() && !held[1].expired(), "the cache and the heap slots did not keep the sampled textures");
+    const auto released = ReleaseTextureCaches(SurfaceBytes, true);
+    Require(held[0].expired() != held[1].expired(), "a memory recovery for one texture's bytes did not free exactly one of two textures that only the cache and the GPU heap held");
+    Require(released >= SurfaceBytes && TextureCacheUsage().sampledEntries == 1u, "a memory recovery did not count the texture it freed from the cache and the GPU heap, or went past its target");
+}
+
 ShaderRecompiler::RecompileResult SampledProgram(std::uint64_t address) {
     ShaderRecompiler::DescriptorBinding binding{};
     binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
@@ -839,6 +875,195 @@ void releasedTests(Context context) {
     cache.Clear();
     ClearCachedTextures(context.device);
     std::puts("resource cache released texture tests passed");
+}
+
+void sampledRecorderBytesTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    Block block(context);
+    ClearCachedTextures(context.device);
+    auto resource = ImageResources(context, block, 0, 1, true);
+    const auto bytes = resource->SampledTextures().front()->AllocationBytes();
+    Require(bytes != 0 && !resource->SampledTextures().front()->ViewsStorageImage(), "the recorder accounting fixture needs an owned sampled allocation");
+    const std::weak_ptr<ShaderResources> released = resource;
+    const std::weak_ptr<Texture> image = resource->SampledTextures().front();
+    Buffer readback(context, sizeof(std::uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    bool counted = false;
+    bool unique = false;
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        const auto commands = recorder.Commands();
+        const auto before = recorder.OpenKeptBytes();
+        resource->KeepStorageImageBytes(recorder);
+        counted = recorder.OpenKeptBytes() == before + bytes;
+        const auto once = recorder.OpenKeptBytes();
+        resource->KeepStorageImageBytes(recorder);
+        unique = recorder.OpenKeptBytes() == once;
+        recorder.Keep(resource);
+        resource.reset();
+        ClearCachedTextures(context.device);
+        Require(!released.expired() && !image.expired(), "accounting released a pending sampled owner");
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, readback.Handle(), 0, sizeof(std::uint32_t), 0x5a5a5a5a);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        std::uint32_t pixel = 0;
+        std::memcpy(&pixel, readback.Bytes().data(), sizeof(pixel));
+        Require(pixel == 0x5a5a5a5a, "recorder completion lost the GPU result");
+    }
+    Require(released.expired() && image.expired(), "completed sampled owner was retained");
+    Require(unique, "sampled allocation counted twice in one batch");
+    Require(counted, "sampled allocation absent from recorder byte bound");
+    std::printf("sampled recorder accounted %llu bytes once; GPU completion and lifetime passed\n", static_cast<unsigned long long>(bytes));
+}
+
+void recyclePressureTests(Context context) {
+    ClearCachedTextures(context.device);
+    constexpr std::uint32_t BigSide = Side * 2;
+    constexpr std::size_t BigBytes = std::size_t{BigSide} * BigSide * 4u;
+    WatchedSurface watched(context, BigBytes);
+    auto first = Sampled(context, watched.Address(), BigSide);
+    Require(TextureCacheUsage().spareEntries == 1 && TextureCacheUsage().spareBytes == BigBytes, "the pressure fixture has no retired CPU snapshot");
+    const auto imageBytes = first->AllocationBytes();
+    const auto present = Recorder::Presents();
+    Buffer readback(context, sizeof(std::uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    bool released = false;
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        const auto commands = recorder.Commands();
+        recorder.Keep(first);
+        const auto freed = ReleaseTextureCaches(BigBytes, true);
+        released = TextureCacheUsage().spareEntries == 0 && TextureCacheUsage().spareBytes == 0;
+        Require(TextureCacheUsage().sampledBytes == imageBytes && Sampled(context, watched.Address(), BigSide) == first, "CPU snapshot recovery changed a held GPU image");
+        Require(!released || freed == BigBytes, "CPU recovery counted the pinned GPU allocation");
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, readback.Handle(), 0, sizeof(std::uint32_t), 0x5a5a5a5a);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        std::uint32_t value = 0;
+        std::memcpy(&value, readback.Bytes().data(), sizeof(value));
+        Require(value == 0x5a5a5a5a, "snapshot recovery changed the GPU completion result");
+    }
+    std::memset(reinterpret_cast<void*>(watched.Address()), 0xb2, BigBytes);
+    auto second = Sampled(context, watched.Address(), BigSide);
+    Require(second != first && Sampled(context, watched.Address(), BigSide) == second, "snapshot recovery bypassed CPU write revalidation");
+    Require(Recorder::Presents() == present, "snapshot recovery changed frame age");
+    Require(released, "memory pressure retained unused CPU snapshot storage");
+    std::printf("retired CPU snapshot %zu bytes released; pinned image, GPU completion and changed guest bytes preserved\n", BigBytes);
+}
+
+void completedPressureTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    auto& cache = SharedResourceCache();
+    cache.Clear();
+    ClearCachedTextures(context.device);
+    Block block(context);
+    struct Cleanup {
+        VkDevice device;
+        ~Cleanup() { SharedResourceCache().Clear(); ClearCachedTextures(device); }
+    } cleanup{context.device};
+    Recorder::CountPresent();
+    const auto present = Recorder::Presents();
+    const auto bytes = Sampled(context, block.Surface(0))->AllocationBytes();
+    const auto capacity = static_cast<std::size_t>(Budget / bytes);
+    std::vector<std::weak_ptr<ShaderResources>> resources;
+    std::vector<std::weak_ptr<Texture>> images;
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        recorder.Commands();
+        for (std::size_t i = 0; i < capacity; ++i) {
+            auto resource = ImageResources(context, block, i, 1, true);
+            cache.Insert({static_cast<std::uint32_t>(i)}, resource);
+            resources.push_back(resource);
+            images.push_back(resource->SampledTextures().front());
+            recorder.Keep(resource);
+        }
+        Sampled(context, block.Surface(capacity));
+        for (const auto& resource : resources) Require(!resource.expired(), "pressure retired a pending recorder resource");
+        for (const auto& image : images) Require(!image.expired(), "pressure retired a pending recorder image");
+        Require(cache.Size() == capacity, "pressure removed a pending resource-cache entry");
+        Require(ReleaseTextureCaches(bytes, true) == 0, "memory recovery retired a pending recorder resource");
+        recorder.Sync();
+    }
+    Require(cache.Size() == capacity, "completion removed unpressured resource-cache entries");
+    Require(ReleaseTextureCaches(bytes, true) >= bytes, "memory recovery could not retire a completed cache-only resource");
+    Require(resources.front().expired() && images.front().expired(), "memory recovery retained the completed sampled image");
+    Require(cache.Size() == capacity - 1u, "memory recovery exceeded its requested target");
+    Sampled(context, block.Surface(capacity));
+    Sampled(context, block.Surface(capacity));
+    Require(resources.front().expired() && images.front().expired(), "completed cache-only texture survived pressure at a fixed present");
+    Require(cache.Size() == capacity - 1u, "pressure retired more resources than the requested image needs");
+    Require(Recorder::Presents() == present, "pressure changed the present serial");
+    cache.Clear();
+    ClearCachedTextures(context.device);
+    static PFN_vkGetDeviceProcAddr originalProc = nullptr;
+    static bool requestRecovery = false;
+    originalProc = context.deviceProc;
+    context.bufferPool.reset();
+    context.deviceProc = +[](VkDevice device, const char* name) -> PFN_vkVoidFunction {
+        if (std::strcmp(name, "vkAllocateMemory") != 0) return originalProc(device, name);
+        return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* allocator, VkDeviceMemory* memory) -> VkResult {
+            if (std::exchange(requestRecovery, false)) static_cast<void>(ReleaseTextureCaches(info->allocationSize, true));
+            return reinterpret_cast<PFN_vkAllocateMemory>(originalProc(device, "vkAllocateMemory"))(device, info, allocator, memory);
+        });
+    };
+    std::weak_ptr<ShaderResources> completed;
+    std::weak_ptr<Texture> completedImage;
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        recorder.Commands();
+        auto resource = ImageResources(context, block, 0, 1, true);
+        completed = resource;
+        completedImage = resource->SampledTextures().front();
+        cache.Insert({1000}, resource);
+        recorder.Keep(resource);
+        resource.reset();
+        requestRecovery = true;
+        Sampled(context, block.Surface(1));
+        Sampled(context, block.Surface(1));
+        Require(!completed.expired() && !completedImage.expired(), "deferred recovery released pending GPU resources");
+        recorder.Sync();
+    }
+    context.bufferPool.reset();
+    requestRecovery = true;
+    Sampled(context, block.Surface(2));
+    Sampled(context, block.Surface(2));
+    Require(completed.expired() && completedImage.expired(), "inherited-lock recovery was not retried after unlocking");
+    Require(Recorder::Presents() == present, "deferred recovery changed the present serial");
+    context.deviceProc = originalProc;
+    cache.Clear();
+    ClearCachedTextures(context.device);
+    std::puts("completed resource-cache pressure and pending recorder lifetime passed");
+}
+
+void commitPressureTests(Context context) {
+    static std::uint64_t requests = 0;
+    requests = 0;
+    context.bufferPool.reset();
+    context.cacheReclaim = +[](VkDeviceSize bytes, bool image) -> VkDeviceSize {
+        ++requests;
+        return ReleaseTextureCaches(bytes, image);
+    };
+    ClearCachedTextures(context.device);
+    Block block(context);
+    const auto present = Recorder::Presents();
+    auto held = Sampled(context, block.Surface(0));
+    const std::weak_ptr<Texture> live = held;
+    auto next = Sampled(context, block.Surface(1));
+    Require(requests != 0, "commit pressure did not request safe cache recovery before allocation");
+    Require(!live.expired() && held->AllocationBytes() != 0 && next->AllocationBytes() != 0, "commit recovery released a live image");
+    Require(Recorder::Presents() == present, "commit pressure changed present serial");
+    held.reset();
+    next.reset();
+    ClearCachedTextures(context.device);
+    std::puts("commit pressure recovery before allocation and live images passed");
 }
 
 void rescanTests(const Context& context) {
@@ -1325,6 +1550,44 @@ int main(int argc, char** argv) {
         if (!memory) setenv("APS5_TEXTURE_CACHE_MIB", recover ? "16" : "1", 1);
         setenv("APS5_TEMPLATE_AUDIT_MS", "250", 0);
 #endif
+        if (mode == "heap-view") {
+#ifdef _WIN32
+            _putenv_s("APS5_GPU_HEAP", "1");
+#else
+            setenv("APS5_GPU_HEAP", "1", 1);
+#endif
+            std::unique_ptr<AgcDriver::VulkanDevice> heapDevice;
+            try {
+                heapDevice = std::make_unique<AgcDriver::VulkanDevice>();
+            } catch (const std::exception& error) {
+                if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) throw;
+                std::printf("skipped, no usable Vulkan device: %s\n", error.what());
+                return VulkanTestSkipped;
+            }
+            if (!heapDevice->GraphicsContext().descriptorHeap) {
+                std::puts("skipped, the device has no VK_EXT_descriptor_heap");
+                return VulkanTestSkipped;
+            }
+            bool tested = false;
+            {
+                const auto context = heapDevice->GraphicsContext();
+                {
+                    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+                    heapHeldReleaseTests(context);
+                    ClearCachedTextures(context.device);
+                    tested = heapViewTests(context);
+                    ClearCachedTextures(context.device);
+                }
+                heapDevice->WaitIdle();
+            }
+            heapDevice.reset();
+            if (!tested) {
+                std::puts("skipped, host imports unavailable: heap views of evicted storage images not tested");
+                return VulkanTestSkipped;
+            }
+            std::puts("heap view release tests passed");
+            return 0;
+        }
         std::unique_ptr<Device> device;
         try {
             device = std::make_unique<Device>(!disableStorageImageMultisample);
@@ -1360,6 +1623,26 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             if (!resourceCacheTests(context, mode)) return VulkanTestSkipped;
             std::puts("resource cache tests passed");
+            return 0;
+        }
+        if (mode == "commit-pressure") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            commitPressureTests(context);
+            return 0;
+        }
+        if (mode == "sampled-recorder-bytes") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            sampledRecorderBytesTests(context);
+            return 0;
+        }
+        if (mode == "recycle-pressure") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            recyclePressureTests(context);
+            return 0;
+        }
+        if (mode == "completed-pressure") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            completedPressureTests(context);
             return 0;
         }
         if (mode == "resource-replaced") {

@@ -116,6 +116,7 @@ void snapshotTableTests(const Context& context, const BdaTestAccess& access) {
         auto a = build(first, false, true, snapshotAddress);
         auto plain = build(first, false, false, snapshotAddress);
         auto d = build(first, true, true, snapshotAddress);
+        const auto spaceTableHitsBefore = BdaResources::TableCacheCounters().spaceTables;
         auto b = build(first, false, true, snapshotAddress);
         auto c = build(second, false, true, snapshotAddress);
         Require(a.snapshot == b.snapshot && a.view == b.view, "two builds of one snapshot with the same bytes do not share its device copy");
@@ -124,6 +125,8 @@ void snapshotTableTests(const Context& context, const BdaTestAccess& access) {
         if (spaces) {
             Require(a.memory->CachedAddressTable().has_value() && c.memory->CachedAddressTable().has_value() && d.memory->CachedAddressTable().has_value(), "a build with its own regions over the address space has no cached BDA table");
             Require(a.table == b.table, "two builds of the same space and snapshot do not share their BDA table");
+            Require(BdaResources::TableCacheCounters().spaceTables == spaceTableHitsBefore + 1, "a repeated build with a stable address-space and MSAA guard generation missed the serial-keyed BDA table");
+            Require(b.bda->Table().range == a.bda->Table().range && b.bda->Table().range != 0, "a cached BDA descriptor lost its byte range: " + std::to_string(b.bda->Table().range) + " instead of " + std::to_string(a.bda->Table().range));
             Require(c.table != a.table, "a build with other snapshot bytes took another build's BDA table");
             Require(a.memory->CachedAddressTable()->serial == b.memory->CachedAddressTable()->serial && c.memory->CachedAddressTable()->serial != a.memory->CachedAddressTable()->serial, "cached BDA table serials do not follow the build's ranges");
         }
@@ -608,6 +611,9 @@ void importJoinTests(const Context& context) {
     Require(prefix != nullptr && prefix->base == heapBase && prefix->bytes == 3 * piece && prefixBuffer == prefix->buffer && prefixCopied == 0, "a buffer bound from the first of three pieces into the last was not imported over the pieces it crosses");
     const auto* kept = HostImportFor(importing, first, 16);
     Require(kept != nullptr && kept->buffer == joinedBuffer && kept->bytes == 2 * large, "a registry change elsewhere re-imported the joined ranges");
+    const auto [startedBuffer, startedCopied] = bind(heapBase, 2 * piece + 32);
+    const auto* started = HostImportFor(importing, heapBase, 2 * piece + 32);
+    Require(started != nullptr && started->base == heapBase && started->bytes == 3 * piece && startedBuffer == started->buffer && startedCopied == 0, "a buffer bound from the start of one piece into the next was not imported as one run");
     change(guest + 2 * large, large, true);
     Require(HostImportFor(importing, first, 16)->buffer == joinedBuffer, "a range registered next to the joined ranges re-imported them");
     const auto [grownBuffer, grownCopied] = bind(third - 16);
@@ -4339,6 +4345,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     const std::array<GuestMemorySnapshot, 1> snapshots{{{0x7fff12340000ULL, source}}};
     ShaderRecompiler::RecompileResult shader;
     shader.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    shader.bdaStores = true;
     CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
     reject([&] { ShaderResources resources(context, compiled, snapshots); }, "ABI version");
     shader.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;

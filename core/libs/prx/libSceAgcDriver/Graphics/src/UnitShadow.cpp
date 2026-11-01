@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -193,12 +194,16 @@ std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t first
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = static_cast<VkDeviceSize>(units) * UnitBytes;
     info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    const bool addressable = BufferPool::ForceAddresses() && context.bufferDeviceAddress;
+    if (addressable) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkBuffer buffer = VK_NULL_HANDLE;
     if (context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer) != VK_SUCCESS) return nullptr;
     VkMemoryRequirements requirements{};
     context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    const VkMemoryAllocateFlagsInfo addressFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+    if (addressable) allocation.pNext = &addressFlags;
     allocation.allocationSize = requirements.size;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     try {
@@ -248,6 +253,7 @@ bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& 
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, transferAccess);
     Recorder::CountBarriers(Recorder::CommandClass::ShadowPublish);
     const auto copyBuffer = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+    recorder->Keep(host);
     std::uint64_t offset = 0;
     for (const auto& entry : copies) {
         std::vector<VkBufferCopy> regions;
@@ -256,8 +262,8 @@ bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& 
             pieces.push_back({shadow.importBase + region.dstOffset - shadow.importLead, offset, region.size});
             offset += region.size;
         }
-        copyBuffer(commands, entry.slab->buffer, host->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
         recorder->Keep(entry.slab);
+        copyBuffer(commands, entry.slab->buffer, host->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
     }
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
     Recorder::CountBarriers(Recorder::CommandClass::ShadowPublish);
@@ -306,6 +312,7 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
         Recorder::CountBarriers(CommandClass::ShadowPublish);
     }
     const auto copyBuffer = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+    if (recorder != nullptr) for (const auto& entry : copies) recorder->Keep(entry.slab);
     for (const auto& entry : copies) copyBuffer(commands, entry.slab->buffer, shadow.importBuffer, static_cast<std::uint32_t>(entry.regions.size()), entry.regions.data());
     // The published bytes are visible to everything recorded after and to the host, as after a fill.
     constexpr VkAccessFlags publishedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
@@ -317,7 +324,6 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     }
     recorder->EndGpuTiming(timing, bytes);
     recorder->MarkCovered(publishedAccess);
-    for (const auto& entry : copies) recorder->Keep(entry.slab);
     // CPU readers reach the import's bytes only after the hook's SyncThrough waits by this note.
     recorder->NotePendingWrites(ranges);
 }
@@ -356,6 +362,21 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     std::uint64_t bytes = 0;
     std::size_t units = 0;
     const auto checked = GuestMemory::TrackerGeneration();
+    struct PublishState {
+        Shadows& registry;
+        UnitShadow& shadow;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> units;
+        bool committed = false;
+        ~PublishState() {
+            if (committed) return;
+            std::lock_guard lock(registry.mutex);
+            for (const auto& [unit, generation] : units) {
+                if (shadow.generation[unit] == generation) shadow.published[unit] = 0;
+            }
+            shadow.Recount();
+        }
+    } publication{registry, *shadow, {}};
+    publication.units.reserve(selected.size());
     {
         // The stamps judged below see every CPU store into the live selected units up to now: a
         // store no collect walked yet would read as fresh and the copy would land over it. Every
@@ -407,6 +428,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
                 copies.back().regions.push_back(region);
                 ranges.emplace_back(begin, end);
             }
+            publication.units.emplace_back(unit, shadow->generation[unit]);
             shadow->published[unit] = 1;
             ++ended;
             slab->lastUse = Recorder::Presents();
@@ -424,6 +446,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     }
     if (const auto hook = publishSelectedHook.load(std::memory_order_acquire)) hook(ranges.front().first, ranges.front().second);
     if (!publishOnCpu() || !recordCopiesOnCpu(*shadow, copies, ranges, bytes, checked)) recordCopies(*shadow, copies, ranges, bytes);
+    publication.committed = true;
     if (ShadowVerify()) verifyPublished(*shadow, copies);
     return units;
 }
@@ -885,6 +908,41 @@ void PublishAllShadows(const Context& context, PublishReason reason) {
         }
     }
     for (const auto& shadow : shadows) publishRange(shadow, shadow->importBase, shadow->ImportEnd(), PublishScope::Whole, reason);
+}
+
+std::uint64_t ReclaimPublishedShadows(std::uint64_t bytes) {
+    if (bytes == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return 0;
+    auto& registry = Registry();
+    std::vector<std::shared_ptr<ShadowSlab>> released;
+    std::uint64_t freed = 0;
+    {
+        std::lock_guard lock(registry.mutex);
+        for (const auto& [base, shadow] : registry.byBase) {
+            for (auto& slab : shadow->slabs) {
+                if (freed >= bytes) break;
+                if (slab == nullptr || slab.use_count() != 1 || slab->pins.load(std::memory_order_acquire) != 0) continue;
+                const auto end = slab->firstUnit + slab->units;
+                bool live = false;
+                for (auto unit = slab->firstUnit; unit < end; ++unit) live = live || shadow->Live(unit);
+                if (live) continue;
+                VkMemoryRequirements requirements{};
+                slab->context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(slab->context.device, slab->buffer, &requirements);
+                released.push_back(slab);
+                for (auto unit = slab->firstUnit; unit < end; ++unit) {
+                    shadow->generation[unit] = 0;
+                    shadow->published[unit] = 0;
+                }
+                registry.liveBytes -= SlabBytes(*slab);
+                --registry.liveSlabs;
+                freed += requirements.size;
+                if (std::getenv("APS5_PROFILE_DRAW") != nullptr) std::fprintf(stderr, "[shadow-reclaim] slab=%p buffer=%p memory=%p bytes=%llu units=%u import=%llx\n", static_cast<void*>(slab.get()), static_cast<void*>(slab->buffer), static_cast<void*>(slab->memory), static_cast<unsigned long long>(requirements.size), slab->units, static_cast<unsigned long long>(shadow->importBase));
+                slab.reset();
+            }
+            if (freed >= bytes) break;
+        }
+    }
+    released.clear();
+    return freed;
 }
 
 void DestroyShadows(VkDevice device) {

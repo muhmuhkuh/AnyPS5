@@ -4,12 +4,63 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <intrin.h>
 #include <malloc.h>
 #include <new>
 #include <windows.h>
 
+thread_local bool ReportLargeHostReleases_nid_no_patch = false;
+
 namespace {
+
+
+struct LargeOwner {
+    void* pointer = nullptr;
+    void* caller = nullptr;
+    std::size_t requested = 0;
+    std::size_t usable = 0;
+};
+constexpr std::size_t OwnerSlots = 65536;
+LargeOwner largeOwners[OwnerSlots];
+SRWLOCK ownerLock = SRWLOCK_INIT;
+std::uint64_t ownerMisses = 0;
+
+void TrackLarge(void* pointer, std::size_t bytes, void* caller) noexcept {
+    if (pointer == nullptr || bytes < 65536) return;
+    const auto usable = _msize(pointer);
+    AcquireSRWLockExclusive(&ownerLock);
+    const auto start = (reinterpret_cast<std::uintptr_t>(pointer) >> 4) % OwnerSlots;
+    bool stored = false;
+    for (std::size_t probe = 0; probe < OwnerSlots; ++probe) {
+        auto& entry = largeOwners[(start + probe) % OwnerSlots];
+        if (entry.pointer == nullptr || entry.pointer == reinterpret_cast<void*>(1)) {
+            entry = {pointer, caller, bytes, usable};
+            stored = true;
+            break;
+        }
+    }
+    if (!stored) ++ownerMisses;
+    ReleaseSRWLockExclusive(&ownerLock);
+}
+
+void ForgetLarge(void* pointer) noexcept {
+    if (pointer == nullptr) return;
+    LargeOwner released;
+    AcquireSRWLockExclusive(&ownerLock);
+    const auto start = (reinterpret_cast<std::uintptr_t>(pointer) >> 4) % OwnerSlots;
+    for (std::size_t probe = 0; probe < OwnerSlots; ++probe) {
+        auto& entry = largeOwners[(start + probe) % OwnerSlots];
+        if (entry.pointer == nullptr) break;
+        if (entry.pointer == pointer) {
+            released = entry;
+            entry.pointer = reinterpret_cast<void*>(1);
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&ownerLock);
+    if (ReportLargeHostReleases_nid_no_patch && released.pointer != nullptr) std::fprintf(stderr, "[host-reclaim-free] pointer=%p caller=%p requested=%zu usable=%zu\n", released.pointer, released.caller, released.requested, released.usable);
+}
 
 constexpr std::size_t Granule = 16;
 constexpr std::size_t LargestCached = 1024;
@@ -166,9 +217,12 @@ void* TryAllocate(std::size_t bytes) noexcept {
     return std::malloc(bytes);
 }
 
-void* Allocate(std::size_t bytes) {
+void* Allocate(std::size_t bytes, void* caller) {
     for (;;) {
-        if (void* block = TryAllocate(bytes)) return block;
+        if (void* block = TryAllocate(bytes)) {
+            TrackLarge(block, bytes, caller);
+            return block;
+        }
         const auto handler = std::get_new_handler();
         if (handler == nullptr) throw std::bad_alloc();
         handler();
@@ -177,6 +231,7 @@ void* Allocate(std::size_t bytes) {
 
 void Release(void* block, std::size_t bytes = 0) noexcept {
     if (block == nullptr) return;
+    if (_msize(block) >= 65536) ForgetLarge(block);
     if (auto* cache = CurrentCache()) {
         const auto usable = bytes != 0 && bytes % Granule == 0 ? bytes : _msize(block);
         if (usable >= Granule && usable < LargestCached + Granule) {
@@ -198,18 +253,52 @@ void Release(void* block, std::size_t bytes = 0) noexcept {
 
 }
 
-void* operator new(std::size_t bytes) { return Allocate(bytes); }
-void* operator new[](std::size_t bytes) { return Allocate(bytes); }
+
+void ReportLargeHostOwners_nid_no_patch(std::uint64_t serial) {
+    struct Group { void* caller = nullptr; std::uint64_t count = 0; std::uint64_t requested = 0; std::uint64_t usable = 0; };
+    Group groups[256]{};
+    std::uint64_t count = 0, requested = 0, usable = 0, ungrouped = 0;
+    AcquireSRWLockShared(&ownerLock);
+    for (const auto& entry : largeOwners) {
+        if (entry.pointer == nullptr || entry.pointer == reinterpret_cast<void*>(1)) continue;
+        ++count;
+        requested += entry.requested;
+        usable += entry.usable;
+        bool found = false;
+        for (auto& group : groups) {
+            if (group.caller != nullptr && group.caller != entry.caller) continue;
+            group.caller = entry.caller;
+            ++group.count;
+            group.requested += entry.requested;
+            group.usable += entry.usable;
+            found = true;
+            break;
+        }
+        if (!found) ++ungrouped;
+    }
+    const auto misses = ownerMisses;
+    ReleaseSRWLockShared(&ownerLock);
+    std::fprintf(stderr, "[large-host-owners] build=%llu count=%llu requested=%llu usable=%llu misses=%llu ungrouped=%llu threshold=65536\n", static_cast<unsigned long long>(serial), static_cast<unsigned long long>(count), static_cast<unsigned long long>(requested), static_cast<unsigned long long>(usable), static_cast<unsigned long long>(misses), static_cast<unsigned long long>(ungrouped));
+    for (const auto& group : groups) {
+        if (group.count == 0) continue;
+        MEMORY_BASIC_INFORMATION info{};
+        VirtualQuery(group.caller, &info, sizeof(info));
+        std::fprintf(stderr, "[large-host-owner] build=%llu caller=%p module=%p rva=%llu count=%llu requested=%llu usable=%llu\n", static_cast<unsigned long long>(serial), group.caller, info.AllocationBase, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(group.caller) - reinterpret_cast<std::uintptr_t>(info.AllocationBase)), static_cast<unsigned long long>(group.count), static_cast<unsigned long long>(group.requested), static_cast<unsigned long long>(group.usable));
+    }
+}
+
+void* operator new(std::size_t bytes) { return Allocate(bytes, __builtin_return_address(0)); }
+void* operator new[](std::size_t bytes) { return Allocate(bytes, __builtin_return_address(0)); }
 void* operator new(std::size_t bytes, const std::nothrow_t&) noexcept {
     try {
-        return Allocate(bytes);
+        return Allocate(bytes, __builtin_return_address(0));
     } catch (...) {
         return nullptr;
     }
 }
 void* operator new[](std::size_t bytes, const std::nothrow_t&) noexcept {
     try {
-        return Allocate(bytes);
+        return Allocate(bytes, __builtin_return_address(0));
     } catch (...) {
         return nullptr;
     }
@@ -222,3 +311,4 @@ void operator delete(void* block, const std::nothrow_t&) noexcept { Release(bloc
 void operator delete[](void* block, const std::nothrow_t&) noexcept { Release(block); }
 
 #endif
+

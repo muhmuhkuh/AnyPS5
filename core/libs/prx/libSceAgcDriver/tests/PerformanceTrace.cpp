@@ -8,6 +8,10 @@
 #include <iterator>
 #include <mutex>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace {
 
 using AgcDriver::TraceFormat;
@@ -62,6 +66,39 @@ void BufferCap() {
     Check(snapshot.slices.size() == 2 && snapshot.dropped, "a full buffer did not stop and set the dropped flag");
     Check(snapshot.eventsLost == 1 && snapshot.eventsFullAt == origin + milliseconds(2) && !snapshot.totalsFull, "a full buffer did not report the lost slice and its time apart from the totals");
     Check(snapshot.totals.size() == 1 && snapshot.totals[0].count == 3 && snapshot.totals[0].length == microseconds(90), "totals missed a slice past the cap");
+}
+
+void GrowingStorage() {
+    std::atomic<std::uint64_t> presents{1};
+    TraceThread thread("growing", presents, TraceThread::MaximumCapacity);
+    const auto origin = Clock::now();
+    const auto empty = thread.Collect();
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION region{};
+    Check(VirtualQuery(empty.slices.data(), &region, sizeof(region)) == sizeof(region) && region.State == MEM_RESERVE, "empty trace storage consumed commit");
+#endif
+    thread.Add("storage", nullptr, origin, origin + microseconds(30));
+    const auto first = thread.Collect();
+    std::atomic<bool> finished{false};
+    std::thread writer([&] {
+        for (std::size_t index = 1; index < TraceThread::MaximumCapacity + 3; ++index)
+            thread.Add("storage", nullptr, origin + microseconds(index), origin + microseconds(index + 30));
+        finished.store(true, std::memory_order_release);
+    });
+    bool stable = true;
+    while (!finished.load(std::memory_order_acquire)) {
+        const auto snapshot = thread.Collect();
+        stable &= snapshot.slices.data() == first.slices.data() && first.slices.front().begin == origin;
+        if (!snapshot.slices.empty()) stable &= snapshot.slices.back().length == microseconds(30);
+    }
+    writer.join();
+    const auto full = thread.Collect();
+    Check(stable && full.slices.size() == TraceThread::MaximumCapacity, "growing storage changed a published snapshot");
+    Check(full.eventsLost == 3 && full.eventsFullAt == origin + microseconds(TraceThread::MaximumCapacity), "growing storage changed exhaustion evidence");
+    Check(full.totals.front().count == TraceThread::MaximumCapacity + 3, "growing storage lost totals");
+#ifdef _WIN32
+    Check(VirtualQuery(full.slices.data() + full.slices.size() - 1, &region, sizeof(region)) == sizeof(region) && region.State == MEM_COMMIT, "written trace storage was not committed");
+#endif
 }
 
 void LostEventsCount() {
@@ -602,6 +639,7 @@ int main() {
         WindowBySeconds();
         WindowRejects();
         BufferCap();
+        GrowingStorage();
         LostEventsCount();
         TotalsOverflow();
         CapacitySettings();

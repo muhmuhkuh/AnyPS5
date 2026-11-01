@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
@@ -5,14 +6,53 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <array>
 #include <exception>
+#include <map>
+#include <mutex>
+#include <cstdio>
+#include <cstdlib>
 #ifdef __APPLE__
 #include <cstring>
+#endif
+
+#ifdef _WIN32
+void ReportLargeHostOwners_nid_no_patch(std::uint64_t serial);
 #endif
 
 namespace AgcDriver::Graphics {
 
 namespace {
+
+struct BufferOwnershipEntry {
+    VkBuffer buffer;
+    BufferBacking backing;
+    std::size_t size;
+    VkBufferUsageFlags usage;
+    VkMemoryPropertyFlags properties;
+};
+struct BufferOwnershipRegistry {
+    std::mutex mutex;
+    std::map<const void*, BufferOwnershipEntry> entries;
+    bool incomplete = false;
+};
+BufferOwnershipRegistry& BufferOwners() {
+    static BufferOwnershipRegistry registry;
+    return registry;
+}
+void NoteBufferOwner(const Buffer* owner, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) noexcept {
+    if (std::getenv("APS5_PROFILE_DRAW") == nullptr) return;
+    auto& state = BufferOwners();
+    std::lock_guard lock(state.mutex);
+    try { state.entries.insert_or_assign(owner, BufferOwnershipEntry{owner->Handle(), owner->Backing(), size, usage, properties}); }
+    catch (...) { state.incomplete = true; }
+}
+void ForgetBufferOwner(const Buffer* owner) noexcept {
+    if (std::getenv("APS5_PROFILE_DRAW") == nullptr) return;
+    auto& state = BufferOwners();
+    std::lock_guard lock(state.mutex);
+    state.entries.erase(owner);
+}
 
 #ifdef __APPLE__
 void ClearPooledTail(void* mapping, std::size_t size, VkDeviceSize mappedBytes, VkMemoryPropertyFlags properties) {
@@ -48,9 +88,45 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
 
 }
 
+
+void ReportBufferOwners(std::uint64_t serial) {
+#ifdef _WIN32
+    ReportLargeHostOwners_nid_no_patch(serial);
+#endif
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
+    auto* recorder = Recorder::Active();
+    const auto pins = recorder != nullptr ? recorder->KeptOwnerStates() : std::map<const void*, std::array<std::size_t, 4>>{};
+    auto& state = BufferOwners();
+    std::lock_guard lock(state.mutex);
+    std::array<std::uint64_t, 16> slots{}, counts{};
+    std::map<VkDeviceMemory, std::uint64_t> blocks;
+    std::vector<std::pair<const void*, BufferOwnershipEntry>> largest;
+    for (const auto& [owner, entry] : state.entries) {
+        unsigned group = 0;
+        if (const auto found = pins.find(owner); found != pins.end()) for (unsigned i = 0; i < 4; ++i) if (found->second[i] != 0) group |= 1u << i;
+        ++counts[group];
+        slots[group] += entry.backing.bytes;
+        blocks[entry.backing.memory] = entry.backing.slab ? BufferPool::SlabBlockBytes(entry.backing.capacity) : entry.backing.bytes;
+        largest.emplace_back(owner, entry);
+    }
+    std::uint64_t blockBytes = 0;
+    for (const auto& [memory, bytes] : blocks) blockBytes += bytes;
+    std::fprintf(stderr, "[buffer-owners] build=%llu incomplete=%u objects=%zu memories=%zu containing-block-bytes=%llu", static_cast<unsigned long long>(serial), state.incomplete, state.entries.size(), blocks.size(), static_cast<unsigned long long>(blockBytes));
+    for (unsigned i = 0; i < counts.size(); ++i) if (counts[i]) std::fprintf(stderr, " {pins=%u count=%llu slot-bytes=%llu}", i, static_cast<unsigned long long>(counts[i]), static_cast<unsigned long long>(slots[i]));
+    std::fprintf(stderr, "\n");
+    std::sort(largest.begin(), largest.end(), [](const auto& a, const auto& b) { return a.second.backing.bytes > b.second.backing.bytes; });
+    for (std::size_t i = 0; i < std::min<std::size_t>(12, largest.size()); ++i) {
+        const auto& [owner, e] = largest[i];
+        const auto found = pins.find(owner);
+        const auto held = found != pins.end() ? found->second : std::array<std::size_t, 4>{};
+        std::fprintf(stderr, "[buffer-owner] build=%llu owner=%p buffer=%p memory=%p offset=%llu slot-bytes=%llu logical=%zu usage=%u properties=%u pins=%zu/%zu/%zu/%zu\n", static_cast<unsigned long long>(serial), owner, static_cast<void*>(e.buffer), static_cast<void*>(e.backing.memory), static_cast<unsigned long long>(e.backing.offset), static_cast<unsigned long long>(e.backing.bytes), e.size, e.usage, e.properties, held[0], held[1], held[2], held[3]);
+    }
+}
+
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
     Require(size != 0, "zero-sized GPU buffer");
-    const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
+    if (!context.bufferDeviceAddress && (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) == 0) this->usage &= ~static_cast<VkBufferUsageFlags>(VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    const bool addressable = (this->usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
     cache = GetBufferPool(context);
     if (const auto allocation = cache->Take(size, this->usage, properties)) {
@@ -71,13 +147,21 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             deviceAddress = 0;
             try {
                 buffer = BindExactBuffer(context, size, this->usage, memory, offset, allocationBytes);
-                initializeAddress(usage);
+                initializeAddress(this->usage);
+            } catch (...) {
+                release();
+                throw;
+            }
+        } else if (deviceAddress == 0) {
+            try {
+                initializeAddress(this->usage);
             } catch (...) {
                 release();
                 throw;
             }
         }
         ready = true;
+        NoteBufferOwner(this, size, this->usage, properties);
         return;
     }
     try {
@@ -104,19 +188,21 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             slab = true;
             allocationBytes = capacity;
             Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, offset), "vkBindBufferMemory slab");
-            initializeAddress(usage);
+            initializeAddress(this->usage);
             mapping = slot.mapping;
 #ifdef __APPLE__
             ClearPooledTail(mapping, size, capacity, properties);
 #endif
             ready = true;
+        NoteBufferOwner(this, size, this->usage, properties);
             return;
         }
         memory = cache->AllocateMemory(allocation, "vkAllocateMemory buffer");
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
-        initializeAddress(usage);
+        initializeAddress(this->usage);
         if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
         ready = true;
+        NoteBufferOwner(this, size, this->usage, properties);
     } catch (...) {
         release();
         throw;
@@ -128,6 +214,7 @@ Buffer::~Buffer() {
 }
 
 void Buffer::release() noexcept {
+    ForgetBufferOwner(this);
     if (ready && cache) {
         cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size});
         return;
@@ -139,7 +226,10 @@ void Buffer::release() noexcept {
     }
     if (mapping) context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, memory);
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) {
+        ForgetCommitAllocation(context.device, memory);
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    }
 }
 
 VkBuffer Buffer::Handle() const {
@@ -162,6 +252,7 @@ void Buffer::Invalidate() {
 
 DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(BufferPool::Usage(usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
     Require(size != 0, "zero-sized device buffer");
+    if (!context.bufferDeviceAddress && (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) == 0) this->usage &= ~static_cast<VkBufferUsageFlags>(VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     cache = GetBufferPool(context);
     if (const auto allocation = cache->Take(size, this->usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
         buffer = allocation->buffer;
@@ -195,6 +286,8 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.allocationSize = ClassAllocationBytes(requirements, capacity);
         allocationBytes = allocation.allocationSize;
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, allocation.allocationSize, "device buffer");
+        const VkMemoryAllocateFlagsInfo addressFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+        if ((this->usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) allocation.pNext = &addressFlags;
         const auto deviceType = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         std::uint32_t allocatedType = allocation.memoryTypeIndex;
         memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer", context.RefusedDeviceMemoryFallback(requirements.memoryTypeBits, allocation.memoryTypeIndex), &allocatedType);
@@ -217,7 +310,10 @@ void DeviceBuffer::release() noexcept {
         return;
     }
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) {
+        ForgetCommitAllocation(context.device, memory);
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    }
 }
 
 VkBuffer DeviceBuffer::Handle() const {
@@ -332,7 +428,10 @@ RenderTarget::~RenderTarget() {
 void RenderTarget::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) {
+        ForgetCommitAllocation(context.device, memory);
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    }
 }
 
 VkImage RenderTarget::Image() const {
@@ -358,6 +457,7 @@ CommandBatch::CommandBatch(const Context& context) : context(context) {
         fence = created;
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        NoteCommandBufferBegun(commands);
         Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer");
         // Work recorded so far goes first in queue order, so this batch sees its results.
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Submit();
