@@ -8388,23 +8388,22 @@ void pipelineLibraryOwnerEvictionTests() {
     const auto thirdAllLibraries = pipelineHandleSnapshot(libraryHandles);
     const auto thirdLibraries = pipelineHandleDifference(thirdAllLibraries, secondAllLibraries);
     const auto afterThird = PipelineLibraryCountersOf(context.device).built;
-    const bool rebuiltEveryPart = std::equal(afterThird.begin(), afterThird.end(), afterSecond.begin(), [](std::uint64_t current, std::uint64_t previous) { return current == previous + 1u; });
-    if (!rebuiltEveryPart) {
-        first.reset();
-        second.reset();
-        third.reset();
-        ClearPipelineLibraries(context.device);
-        Require(false, "cap-one A/B/A did not rebuild the evicted library parts");
-    }
-    for (const auto handle : firstLibraries) Require(pipelineDestroyCount(handle) == 0u, "rebuilding A invalidated the original linked pipeline's library owner");
+    Require(afterThird == afterSecond && thirdLibraries.empty(), "cap-one A/B/A did not reuse the evicted live library parts");
+    for (const auto handle : firstLibraries) Require(pipelineDestroyCount(handle) == 0u, "reusing A invalidated the original linked pipeline's library owner");
     first.reset();
+    for (const auto handle : firstLibraries) Require(pipelineDestroyCount(handle) == 0u, "a reused library was destroyed before its last linked pipeline");
+    third.reset();
     requirePipelinesDestroyedOnce(firstLibraries);
+    auto fourth = buildOwnerTestPipeline(context, 401u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 15u, false);
+    const auto afterFourth = PipelineLibraryCountersOf(context.device).built;
+    Require(std::equal(afterFourth.begin(), afterFourth.end(), afterThird.begin(), [](std::uint64_t current, std::uint64_t previous) { return current == previous + 1u; }), "an expired library was not rebuilt");
+    const auto fourthLibraries = pipelineHandleDifference(pipelineHandleSnapshot(libraryHandles), thirdAllLibraries);
     ClearPipelineLibraries(context.device);
     for (const auto handle : secondLibraries) Require(pipelineDestroyCount(handle) == 0u, "normal cache clear destroyed a library still leased by a linked pipeline");
     second.reset();
-    third.reset();
+    fourth.reset();
     requirePipelinesDestroyedOnce(secondLibraries);
-    requirePipelinesDestroyedOnce(thirdLibraries);
+    requirePipelinesDestroyedOnce(fourthLibraries);
     const auto allLibraries = pipelineHandleSnapshot(libraryHandles);
     for (const auto handle : allLibraries) Require(pipelineDestroyCount(handle) == 1u, "a library handle was destroyed more or less than once");
     Require(mock.live == 0, "the GPL owner eviction test leaked mock Vulkan objects");

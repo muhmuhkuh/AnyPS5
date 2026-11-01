@@ -155,7 +155,7 @@ void CheckDrawn(PipelineTrace& trace, bool optimized) {
     Require(std::find(expected.begin(), expected.end(), trace.drawn.front()) != expected.end(), optimized ? "readback draw did not bind an optimized pipeline" : "readback draw did not bind a fast-linked pipeline");
 }
 
-void Run(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace, std::uint32_t waveSize, VkFormat depthFormat, bool optimize, bool evictionVariant = false, std::uint64_t expectedLinkDelta = 1) {
+void Run(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace, std::uint32_t waveSize, VkFormat depthFormat, bool optimize, bool evictionVariant = false, std::uint64_t expectedLinkDelta = 1, bool reuseVariant = false) {
     const bool masked = depthFormat == VK_FORMAT_UNDEFINED;
     const auto linksBefore = PipelineLibraryCountersOf(context.device).linked;
     const auto target = device.Target();
@@ -201,7 +201,7 @@ void Run(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace,
     state.hasColorTarget = true;
     state.renderExtent = {Width, Height};
     state.topology = evictionVariant ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    if (evictionVariant) state.provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
+    if (evictionVariant || reuseVariant) state.provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
     state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
     state.negativeOneToOne = false;
     state.scissor = {{0, 0}, {Width, Height}};
@@ -298,6 +298,10 @@ int main(int argc, char** argv) {
             for (std::size_t part = 0; part < 4; ++part) Require(evictedAfterSecond[part] > evictedAfterFirst[part] && evictedAfterFirst[part] >= evictedBefore[part], "the GPU readback did not evict a library from every GPL part");
             Run(*device, context, trace, 64u, VK_FORMAT_D32_SFLOAT, false, false, 0u);
             Require(trace.drawn.at(0) == firstPipeline, "the original linked pipeline was not reused after its libraries left the GPL cache");
+            const auto builtBeforeReuse = PipelineLibraryCountersOf(context.device).built;
+            Run(*device, context, trace, 64u, VK_FORMAT_D32_SFLOAT, false, false, 1u, true);
+            const auto builtAfterReuse = PipelineLibraryCountersOf(context.device).built;
+            Require(builtAfterReuse[2] == builtBeforeReuse[2] && builtAfterReuse[3] == builtBeforeReuse[3], "the new pipeline rebuilt live evicted fragment libraries");
             std::puts("pipeline-library eviction readback passed with the original linked pipeline after all four part caches evicted it");
         } else {
             Run(*device, context, trace, mode == "color32" ? 32u : 64u, masked ? VK_FORMAT_UNDEFINED : (mode == "d16" ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT), optimize);

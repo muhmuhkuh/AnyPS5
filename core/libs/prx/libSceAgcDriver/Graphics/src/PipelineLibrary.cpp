@@ -130,6 +130,7 @@ struct DeviceLibraries {
     PFN_vkDestroyShaderModule destroyModule = nullptr;
     std::map<Key, VkPipelineLayout> layouts;
     std::array<std::map<Key, LibraryCacheEntry>, 4> parts;
+    std::array<std::map<Key, std::weak_ptr<LibraryOwner>>, 4> retired;
     std::array<std::list<Key>, 4> lru;
     std::shared_ptr<LibraryRegistry> registry = std::make_shared<LibraryRegistry>();
     std::shared_ptr<LibraryLiveCounters> live = registry->live;
@@ -298,10 +299,23 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         auto key = Combined(*partKeys[part], *contextKeys[part]);
         key.push_back(static_cast<std::byte>(optimize));
         auto& cache = device.parts[part];
+        auto& retired = device.retired[part];
+        const auto findRetired = [&]() -> std::shared_ptr<LibraryOwner> {
+            const auto found = retired.find(key);
+            if (found == retired.end()) return {};
+            auto owner = found->second.lock();
+            if (!owner) retired.erase(found);
+            return owner;
+        };
         if (const auto found = cache.find(key); found != cache.end()) {
             device.lru[part].splice(device.lru[part].end(), device.lru[part], found->second.lru);
             owners.push_back(found->second.owner);
             libraries.push_back(found->second.owner->handle);
+            continue;
+        }
+        if (auto owner = findRetired()) {
+            libraries.push_back(owner->handle);
+            owners.push_back(std::move(owner));
             continue;
         }
         PerformanceTimer timing("Vulkan.GraphicsPipelineLibrary");
@@ -355,6 +369,12 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             libraries.push_back(raced->second.owner->handle);
             continue;
         }
+        if (auto owner = findRetired()) {
+            device.destroyPipeline(context.device, handle, nullptr);
+            libraries.push_back(owner->handle);
+            owners.push_back(std::move(owner));
+            continue;
+        }
         PendingLibrary pending{context.device, device.destroyPipeline, device.destroyModule, handle, {}};
         if (optimize) {
             for (std::uint32_t stage = 0; stage < create.stageCount; ++stage) {
@@ -386,9 +406,13 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         libraries.push_back(handle);
         while (cacheLimit != 0 && cache.size() > cacheLimit) {
             const auto victimKey = device.lru[part].front();
+            const auto victim = cache.find(victimKey);
+            if (victim->second.owner.use_count() > 1) retired.insert_or_assign(victimKey, victim->second.owner);
             device.lru[part].pop_front();
-            cache.erase(victimKey);
+            cache.erase(victim);
             ++device.counters->evicted[part];
+            if (device.counters->evicted[part] % 128u == 0u)
+                std::erase_if(retired, [](const auto& entry) { return entry.second.expired(); });
         }
     }
     if (partsOnly) return VK_NULL_HANDLE;
