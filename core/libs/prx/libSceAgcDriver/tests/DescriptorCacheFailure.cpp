@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <memory>
 
 namespace {
 thread_local bool failNextAllocation = false;
@@ -132,6 +133,86 @@ bool LayoutFailure(bool updateAfterBind) {
     return objects.layouts == 0;
 }
 
+constexpr std::uint32_t DedicatedStorageBufferCount = 4097;
+const VkDescriptorSetLayoutBinding leaseBinding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, DedicatedStorageBufferCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+const std::array<std::uint32_t, 4> leaseKey{leaseBinding.binding, leaseBinding.descriptorType, leaseBinding.descriptorCount, leaseBinding.stageFlags};
+const VkDescriptorPoolSize leaseSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, DedicatedStorageBufferCount};
+
+Context LeaseTestContext() {
+    auto context = TestContext();
+    context.limits.maxPerStageResources = DedicatedStorageBufferCount + 1u;
+    context.limits.maxDescriptorSetStorageBuffers = DedicatedStorageBufferCount + 1u;
+    context.descriptorIndexingLimits.maxPerStageUpdateAfterBindResources = DedicatedStorageBufferCount + 1u;
+    context.descriptorIndexingLimits.maxDescriptorSetUpdateAfterBindStorageBuffers = DedicatedStorageBufferCount + 1u;
+    return context;
+}
+
+std::shared_ptr<const TableDescriptors> TableMarker(std::uint32_t marker) {
+    auto table = std::make_shared<TableDescriptors>();
+    table->binding = marker;
+    return table;
+}
+
+void CheckLeaseFixtureCleanup() {
+    RequireTest(objects.layouts == 0 && objects.pools == 0, "lease-order fixture leaked mock Vulkan objects");
+}
+
+void LeaseOrderLateReturn() {
+    objects = {};
+    {
+        DescriptorCache cache(LeaseTestContext());
+        const auto layout = cache.Layout(leaseKey, std::span(&leaseBinding, 1));
+        const auto oldSet = cache.Allocate(layout, std::span(&leaseSize, 1));
+        const auto newSet = cache.Allocate(layout, std::span(&leaseSize, 1));
+        const auto oldTable = TableMarker(101);
+        const auto newTable = TableMarker(202);
+        cache.Free(newSet, newTable);
+        cache.Free(oldSet, oldTable);
+        const auto selected = cache.Allocate(layout, std::span(&leaseSize, 1));
+        RequireTest(selected.set == newSet.set, "late old lease displaced the newer kept descriptor set");
+        RequireTest(selected.table == newTable && selected.table->binding == 202u, "selected set lost its paired table marker");
+        cache.Free(selected, selected.table);
+    }
+    CheckLeaseFixtureCleanup();
+}
+
+void LeaseOrderRecycledLease() {
+    objects = {};
+    {
+        DescriptorCache cache(LeaseTestContext());
+        const auto layout = cache.Layout(leaseKey, std::span(&leaseBinding, 1));
+        auto oldSet = cache.Allocate(layout, std::span(&leaseSize, 1));
+        const auto newSet = cache.Allocate(layout, std::span(&leaseSize, 1));
+        const auto oldTable = TableMarker(303);
+        const auto newTable = TableMarker(404);
+        oldSet.table = oldTable;
+        cache.Recycle(layout, oldSet);
+        const auto rewritten = cache.AllocateRewritten(layout, std::span(&leaseSize, 1));
+        RequireTest(rewritten.set == oldSet.set, "recycled allocation did not return the recycled set");
+        RequireTest(rewritten.table == oldTable && rewritten.table->binding == 303u, "recycled set lost its table marker");
+        cache.Free(rewritten, rewritten.table);
+        cache.Free(newSet, newTable);
+        const auto selected = cache.Allocate(layout, std::span(&leaseSize, 1));
+        RequireTest(selected.set == rewritten.set, "older return displaced the recycled set's newer lease");
+        RequireTest(selected.table == oldTable && selected.table->binding == 303u, "recycled lease selected a mismatched table marker");
+        cache.Free(selected, selected.table);
+    }
+    CheckLeaseFixtureCleanup();
+}
+
+int LeaseOrderTests() {
+    const char* capacityText = std::getenv("APS5_KEPT_DESCRIPTOR_SETS");
+    const auto capacity = capacityText != nullptr ? std::strtoul(capacityText, nullptr, 10) : 0ul;
+    if (capacity != 1ul && capacity != 2ul) {
+        std::fprintf(stderr, "lease-order tests require APS5_KEPT_DESCRIPTOR_SETS=1 or 2\n");
+        return 2;
+    }
+    LeaseOrderLateReturn();
+    LeaseOrderRecycledLease();
+    std::printf("lease-order capacity=%lu: passed\n", capacity);
+    return 0;
+}
+
 bool PoolFailure(bool updateAfterBind, bool grow) {
     objects = {};
     {
@@ -159,7 +240,9 @@ bool PoolFailure(bool updateAfterBind, bool grow) {
 }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--lease-order") == 0) return LeaseOrderTests();
+    if (argc != 1) return 2;
     int failures = 0;
     for (const bool updateAfterBind : {false, true}) {
         if (!LayoutFailure(updateAfterBind)) ++failures;

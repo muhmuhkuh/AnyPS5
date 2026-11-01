@@ -1559,6 +1559,39 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     return complete;
 }
 
+#ifdef _WIN32
+void traceCoverageRefusal(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
+    static const bool enabled = std::getenv("APS5_TRACE_WRITE_TRACKING") != nullptr;
+    if (!enabled) return;
+    enum class Reason : std::size_t { NotWatched, OutsideArena, HostRegion, CoverageExcluded, Count };
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Reason::Count)> counts{};
+    static std::atomic<std::uint64_t> total{0};
+    Reason reason = Reason::CoverageExcluded;
+    if (!tracker.watched) reason = Reason::NotWatched;
+    else if (address < tracker.base || bytes > tracker.size || address - tracker.base > tracker.size - bytes) reason = Reason::OutsideArena;
+    else if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes)) reason = Reason::HostRegion;
+    const auto index = static_cast<std::size_t>(reason);
+    const auto event = total.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto count = counts[index].fetch_add(1, std::memory_order_relaxed) + 1;
+    static constexpr const char* names[] = {"not-watched", "outside-arena", "host-region", "coverage-excluded"};
+    const bool detail = event <= 32;
+    const bool summary = event > 32 && (event & (event - 1)) == 0 && event <= (std::uint64_t{1} << 24);
+    if (detail) {
+        std::fprintf(stderr, "[write-trace] coverage refusal #%llu reason=%s reason-count=%llu range=0x%llx+0x%zx arena=0x%llx+0x%zx watched=%u coverage=%u hostRegion=%u\n",
+            static_cast<unsigned long long>(event), names[index], static_cast<unsigned long long>(count),
+            static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(tracker.base), tracker.size,
+            tracker.watched ? 1u : 0u, tracker.coverage.Covers(address, bytes) ? 1u : 0u,
+            tracker.watched && address >= tracker.base && bytes <= tracker.size && address - tracker.base <= tracker.size - bytes &&
+                GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes) ? 1u : 0u);
+    } else if (summary) {
+        std::fprintf(stderr, "[write-trace] coverage totals events=%llu not-watched=%llu outside-arena=%llu host-region=%llu coverage-excluded=%llu\n",
+            static_cast<unsigned long long>(event), static_cast<unsigned long long>(counts[0].load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(counts[1].load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts[2].load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(counts[3].load(std::memory_order_relaxed)));
+    }
+}
+#endif
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
@@ -1594,7 +1627,19 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
+    if (!tracker.watched) {
+#ifdef _WIN32
+        traceCoverageRefusal(tracker, address, bytes);
+#endif
+        return 0;
+    }
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+    if (!tracker.covers(address, bytes)) {
+#ifdef _WIN32
+        traceCoverageRefusal(tracker, address, bytes);
+#endif
+        return 0;
+    }
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
@@ -2677,13 +2722,28 @@ void CopyGuestBytes(void* destination, const void* source, std::size_t bytes) {
 
 namespace {
 
+void copyCommittedRange(std::uint64_t address, std::span<std::byte> destination) {
+#ifdef _WIN32
+    SIZE_T copied = 0;
+    const BOOL success = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), destination.data(), destination.size(), &copied);
+    const DWORD error = GetLastError();
+    if (!success || copied != destination.size()) {
+        char message[256];
+        std::snprintf(message, sizeof(message), "AGC driver: committed guest read of 0x%llx+0x%zx failed after 0x%zx bytes (Windows error %lu)", static_cast<unsigned long long>(address), destination.size(), static_cast<std::size_t>(copied), static_cast<unsigned long>(success ? ERROR_SUCCESS : error));
+        throw std::runtime_error(message);
+    }
+#else
+    std::memcpy(destination.data(), reinterpret_cast<const void*>(address), destination.size());
+#endif
+}
+
 void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (Accessible(reinterpret_cast<const void*>(address), destination.size())) {
-        std::memcpy(destination.data(), reinterpret_cast<const void*>(address), destination.size());
+        copyCommittedRange(address, destination);
         return;
     }
     std::memset(destination.data(), 0, destination.size());
-    for (const auto& [begin, end] : CommittedRanges(address, destination.size())) std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+    for (const auto& [begin, end] : CommittedRanges(address, destination.size())) copyCommittedRange(begin, destination.subspan(static_cast<std::size_t>(begin - address), static_cast<std::size_t>(end - begin)));
 }
 
 }
@@ -2740,7 +2800,13 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
     auto outcome = Compare::Equal;
     const bool queried = describePages(static_cast<std::uintptr_t>(address), out.size(), [&](const PageRun& run) {
         if (!run.readable) outcome = Compare::Unmapped;
-        else std::memcpy(out.data() + (run.begin - address), reinterpret_cast<const void*>(run.begin), static_cast<std::size_t>(run.end - run.begin));
+        else {
+            try {
+                copyCommittedRange(run.begin, out.subspan(static_cast<std::size_t>(run.begin - address), static_cast<std::size_t>(run.end - run.begin)));
+            } catch (const std::runtime_error&) {
+                outcome = Compare::Unmapped;
+            }
+        }
         return outcome == Compare::Equal;
     });
     return queried ? outcome : Compare::Unmapped;

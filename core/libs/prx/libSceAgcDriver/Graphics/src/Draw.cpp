@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CpuPhaseStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "ThreadOwned.hpp"
@@ -391,7 +392,7 @@ void requireCmaskCodes(std::uint32_t codes) {
     Require((codes & 1u) == 0, "a CMASK fast clear of a DCC color target, whose clear belongs in its DCC keys, was recorded");
 }
 
-CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::vector<std::uint32_t>& cleared) {
+CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::vector<std::uint32_t>& cleared, std::vector<std::byte>* snapshot = nullptr) {
     const auto address = color.cmaskAddress;
     const auto bytes = layout.Bytes();
     const bool locked = GuestMemory::GpuMutex().HeldByThisThread();
@@ -410,6 +411,7 @@ CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::v
     }
     std::vector<std::byte> mask(bytes);
     GuestMemory::Read(address, mask, CmaskLayout::Alignment);
+    if (snapshot != nullptr) *snapshot = mask;
     const auto uniform = [&](std::byte value) { return std::all_of(mask.begin(), mask.end(), [&](std::byte entry) { return entry == value; }); };
     if (color.coverageSamples > color.samples) {
         for (std::uint32_t tileY = 0; tileY < layout.TilesY(); ++tileY) {
@@ -473,13 +475,80 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
     proveCmask(address, bytes, GuestMemory::MarkWritten(address, bytes));
 }
 
+void materializeMatchingDccCmaskClear(const ColorTarget& color, const CmaskLayout& layout, const std::shared_ptr<StorageTexture>& resident) {
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "a matching CMASK/DCC clear requires the device lock");
+    Require(color.samples == 1 && color.coverageSamples > color.samples, "a CMASK fast clear of a DCC color target outside a one-fragment EQAA target is not implemented");
+    Require(color.mipCount == 1 && color.mip == 0 && !color.mipTail && color.depth == 1 && color.depthSlice == 0 && color.layers == 1 && color.arrayAddress == 0 && color.arrayLastSlice == 0 && color.arraySlice == 0 && color.surfaceAddress == color.address && color.surfaceExtent.width == color.extent.width && color.surfaceExtent.height == color.extent.height, "a matching CMASK/DCC clear outside a complete single-level single-layer surface is not implemented");
+    Require(color.elementBytes == 1 || color.elementBytes == 2 || color.elementBytes == 4 || color.elementBytes == 8, "a matching CMASK/DCC clear with this element size is not implemented");
+    const ColorTargetLayout surface(color.extent.width, color.extent.height, color.tileMode, color.elementBytes, color.pipeBankXor);
+    Require(surface.Bytes() == color.bytes && color.bytes != 0, "a matching CMASK/DCC clear has a different physical surface layout");
+    const auto keysBytes = colorKeyCount(color, color.bytes);
+    const auto maskBytes = layout.Bytes();
+    const std::array<std::pair<std::uint64_t, std::size_t>, 3> ranges{{{color.address, color.bytes}, {color.dccAddress, keysBytes}, {color.cmaskAddress, maskBytes}}};
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const auto [address, bytes] = ranges[i];
+        Require(bytes != 0 && address <= std::numeric_limits<std::uint64_t>::max() - bytes && GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes, true), "a matching CMASK/DCC clear has an inaccessible physical range");
+        for (std::size_t j = 0; j < i; ++j) {
+            const auto [other, otherBytes] = ranges[j];
+            Require(address >= other + otherBytes || other >= address + bytes, "a matching CMASK/DCC clear has overlapping physical ranges");
+        }
+    }
+    if (resident != nullptr) {
+        const auto& descriptor = resident->Descriptor();
+        Require(resident->GuestBytes() == color.bytes && resident->ImageLayers() == 1 && resident->ImageDepth() == 1, "a matching CMASK/DCC clear has an incompatible resident physical extent");
+        Require(descriptor.baseAddress == color.address && descriptor.width == color.extent.width && descriptor.height == color.extent.height && descriptor.depthOrLastArray == 0 && descriptor.baseArray == 0 && descriptor.mipCount == 1 && descriptor.baseLevel == 0 && descriptor.lastLevel == 0 && descriptor.dimension == TextureDimension::k2D, "a matching CMASK/DCC clear has an incompatible resident subresource");
+        Require(descriptor.tileMode == ColorTextureTileMode(color.tileMode) && descriptor.pipeBankXor == color.pipeBankXor && ResolveTextureFormat(descriptor.format) == color.format, "a matching CMASK/DCC clear has an incompatible resident texel interpretation");
+        Require(descriptor.dccAddress == 0 || (descriptor.dccAddress == color.dccAddress && descriptor.dccPipeAligned == color.dccPipeAligned && descriptor.dccAlphaOnMsb == color.dccAlphaOnMsb), "a matching CMASK/DCC clear has incompatible resident metadata");
+    }
+    const auto texel = clearTexel(color, DccKeys::ClearRegister);
+    const auto prove = [&] {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(color.dccAddress, keysBytes)) {
+            Recorder::CountSync(2);
+            recorder->SyncThrough(color.dccAddress, keysBytes);
+        }
+        std::vector<std::uint32_t> cleared;
+        std::vector<std::byte> mask;
+        Require(readCmask(color, layout, cleared, &mask) == CmaskState::Cleared, "a matching CMASK/DCC clear without a complete CMASK clear proof is not implemented");
+        const auto keys = CurrentDccKeys(color.dccAddress, color.bytes, keysBytes);
+        Require(IsDccClear(keys), "a matching CMASK/DCC clear without a complete known DCC clear proof is not implemented");
+        const auto dccTexel = clearTexel(color, keys);
+        Require(std::memcmp(texel.data(), dccTexel.data(), color.elementBytes) == 0, "a CMASK clear whose exact texel differs from its DCC clear is not implemented");
+        std::vector<std::byte> confirmedMask;
+        cleared.clear();
+        Require(readCmask(color, layout, cleared, &confirmedMask) == CmaskState::Cleared && confirmedMask == mask, "CMASK changed while proving its matching DCC clear");
+        return std::pair{keys, std::move(mask)};
+    };
+    const auto proof = prove();
+    StorageTexture::FlushPending(color.address, color.bytes, nullptr, "matching CMASK/DCC fast-clear materialization", PublishScope::Whole);
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> colorRange{{{color.address, color.address + color.bytes}}};
+    Require(!StorageTexture::AnyPendingOverlaps(colorRange), "a matching CMASK/DCC clear still has pending texel results");
+    Require(prove() == proof, "CMASK/DCC changed while publishing pending texel results");
+    writeTexels(color, texel);
+    MarkDccUncompressed(color.dccAddress, color.bytes, keysBytes);
+    const std::vector<std::byte> expanded(maskBytes, std::byte{0xff});
+    GuestMemory::Write(color.cmaskAddress, expanded, CmaskLayout::Alignment);
+    proveCmask(color.cmaskAddress, maskBytes, GuestMemory::CollectWrites(color.cmaskAddress, maskBytes));
+    if (resident != nullptr) resident->Refresh();
+}
+
 bool materializeCmaskClear(const Context& context, const ColorTarget& color, const std::shared_ptr<StorageTexture>& resident) {
     if (color.cmaskAddress == 0) return false;
+    std::unique_lock<GuestMemory::GpuMutexType> gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    if (color.dccAddress != 0 && !GuestMemory::GpuMutex().HeldByThisThread()) gpuLock.lock();
     if (context.detiler != nullptr) requireCmaskCodes(context.detiler->CmaskErrors());
     const CmaskLayout layout(color.extent.width, color.extent.height);
     const auto bytes = layout.Bytes();
     Require(color.cmaskBytes == bytes, "CMASK size differs from the color target's CMASK layout");
     if (cmaskProved(color.cmaskAddress, bytes)) return false;
+    if (color.dccAddress != 0) {
+        std::vector<std::uint32_t> cleared;
+        if (readCmask(color, layout, cleared) == CmaskState::Expanded) {
+            proveCmask(color.cmaskAddress, bytes, GuestMemory::CollectWrites(color.cmaskAddress, bytes));
+            return false;
+        }
+        materializeMatchingDccCmaskClear(color, layout, resident);
+        return false;
+    }
     if (color.coverageSamples > color.samples) {
         std::vector<std::uint32_t> codes;
         static_cast<void>(readCmask(color, layout, codes));
@@ -1637,6 +1706,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::shared_ptr<StorageTexture> resident;
+    if (color.cmaskAddress != 0 && color.dccAddress != 0) materializeCmaskClear(context, color, nullptr);
     try {
         resident = lookup();
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
@@ -2507,6 +2577,7 @@ struct PreparedDraw {
     int dumpLimit = 0;
     std::vector<TargetBinding> targets;
     std::vector<VkImageView> targetViews;
+    std::shared_ptr<void> depthOwner;
     Recorder* recorder = nullptr;
     ResolvedResources resolved;
     IndirectRecord indirect;
@@ -2528,6 +2599,7 @@ struct PreparedDraw {
 };
 
 bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw& prepared) {
+    CpuPhaseStats::ScopeTimer phaseTimer(CpuPhaseStats::Phase::DrawPrepare, true, true);
     auto*& recipeOut = prepared.recipeOut;
     auto& stencilReferences = prepared.stencilReferences;
     for (const auto& shader : shaders) {
@@ -2696,8 +2768,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         targetViews.push_back(binding.target->View());
     }
     if (state.depth) {
-        targetViews.push_back(DepthSurfaceView(context, *state.depth, state.depthWrite));
-        if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
+        targetViews.push_back(DepthSurfaceView(context, *state.depth, state.depthWrite, &prepared.depthOwner));
     }
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
@@ -2860,7 +2931,11 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.moved.clear();
     }
-    if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
+    if (state.depth) {
+        RevalidateDepthSurfaceView(context, *state.depth, targetViews.back());
+        RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
+        if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
+    }
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto& masked = prepared.masked;
@@ -2920,6 +2995,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
 }
 
 void recordPreparedDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, PreparedDraw& prepared) {
+    CpuPhaseStats::ScopeTimer phaseTimer(CpuPhaseStats::Phase::DrawRecord, true, true);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     static AgcDriver::Mutex dumpMutex;
@@ -2994,6 +3070,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->key = contentKey;
             recipe->pipeline = pipeline;
             recipe->framebuffer = framebuffer;
+            recipe->depthOwner = prepared.depthOwner;
             for (const auto& owner : owners) recipe->targets.emplace_back(owner);
             recipe->targetViews = targetViews;
             recipe->passKey = DrawRenderPassKey(context, state, targetViews);
@@ -3421,12 +3498,12 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
         targets.push_back(std::move(resident));
     }
+    std::shared_ptr<void> depthOwner;
     if (recipe.hasDepth) {
         timer.phase(PhaseSetup);
-        const auto depthView = DepthSurfaceView(context, *state.depth, state.depthWrite);
-        if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
+        const auto depthView = DepthSurfaceView(context, *state.depth, state.depthWrite, &depthOwner);
         timer.phase(PhaseReadTarget);
-        if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
+        if (recipe.targetViews.back() != depthView || recipe.depthOwner.lock().get() != depthOwner.get()) return miss(DrawRecipeMiss::TargetGone);
     }
     timer.phase(PhasePrepare);
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed
@@ -3445,6 +3522,11 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         recorder->Keep(std::move(resources));
         timer.phase(PhaseLookup);
         return miss(DrawRecipeMiss::Proof);
+    }
+    if (state.depth) {
+        RevalidateDepthSurfaceView(context, *state.depth, recipe.targetViews.back());
+        RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
+        if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     }
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     SharedResourceCache().Touch(recipe.key);

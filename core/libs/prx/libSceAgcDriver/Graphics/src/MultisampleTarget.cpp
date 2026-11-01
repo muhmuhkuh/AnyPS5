@@ -1,4 +1,6 @@
 #include <shared_mutex>
+#include <limits>
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTextureLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -19,6 +21,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -144,7 +148,7 @@ void recordCommands(const Context& context, Record&& record) {
 
 class MultisampleTarget : public std::enable_shared_from_this<MultisampleTarget> {
 public:
-    MultisampleTarget(const Context& context, const ColorTarget& target) : context(context), target(target), cmask(target.cmaskAddress, target.cmaskBytes), colorFill(target) {
+    MultisampleTarget(const Context& context, const ColorTarget& target, std::span<const std::byte> sourceSamples = {}) : context(context), target(target), cmask(target.cmaskAddress, target.cmaskBytes), colorFill(target) {
         this->context.bufferPool.reset();
         if (target.dccAddress != 0) metadataValid = std::make_shared<std::atomic<bool>>(true);
         const auto initial = initialDccClear(target);
@@ -176,6 +180,15 @@ public:
             return (uintProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0 && storageSupports(uintFormat, VK_IMAGE_USAGE_STORAGE_BIT, 0u);
         };
         if (storageFormat != VK_FORMAT_UNDEFINED && (!context.storageImageMultisample || !storageSupports(storageFormat, VK_IMAGE_USAGE_STORAGE_BIT, 0u) || !storageSupports(target.format, usage | VK_IMAGE_USAGE_STORAGE_BIT, storageFlags) || !uintStorageSupported())) storageFormat = VK_FORMAT_UNDEFINED;
+        auto creationFlags = orderFlags;
+        if (!sourceSamples.empty()) {
+            prepareImport(sourceSamples);
+            usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+            creationFlags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+            Require(storageSupports(VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_STORAGE_BIT, 0u), "the device cannot upload R32F multisample contents through an unsigned view");
+            Check(context.imageFormatProperties(context.physical, target.format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, creationFlags, &supported), "vkGetPhysicalDeviceImageFormatProperties guest multisample import");
+            Require((supported.sampleCounts & samples) != 0 && target.extent.width <= supported.maxExtent.width && target.extent.height <= supported.maxExtent.height, "guest multisample import exceeds device image limits");
+        }
         twinFormat = colorTwinFormat(context, target.format);
         if (twinFormat != VK_FORMAT_UNDEFINED) {
             VkFormatProperties twinProperties{};
@@ -184,23 +197,87 @@ public:
             if ((twinProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) == 0 || !storageSupports(target.format, usage, twinFlags) || !storageSupports(twinFormat, twinViewUsage, twinFlags)) twinFormat = VK_FORMAT_UNDEFINED;
         }
         try {
-            const auto created = allocate(usage, orderFlags);
+            const auto created = allocate(usage, creationFlags);
             image = created.image;
             memory = created.memory;
             view = created.view;
             allocationBytes = created.bytes;
+            if (importedUpload) {
+                VkImageViewUsageCreateInfo storageUsage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+                storageUsage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+                VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                info.pNext = &storageUsage;
+                info.image = image;
+                info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+                info.format = VK_FORMAT_R32_UINT;
+                info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &importedView), "vkCreateImageView guest multisample import");
+            }
             recordCommands(context, [&](VkCommandBuffer commands, Recorder* recorder) {
                 recordToGeneral(commands, image);
                 const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
                 context.Resolved(&DeviceFunctions::cmdClearColorImage, "vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &initial, 1, &range);
                 RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
                 if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+                recordImport(commands, recorder);
             });
         } catch (...) {
             release();
             throw;
         }
     }
+    static void ValidateImportedSource(const GuestTextureResource& source) {
+        Require(source.dimension == TextureDimension::k2DMsaa && source.baseArray == 0u && source.depthOrLastArray == 0u && source.baseLevel == 0u && source.lastLevel == 0u && source.mipCount == 1u && source.allocatedMipCount <= 1u && source.minLod == 0u, "imported R32F multisample texture subresources are not implemented");
+    }
+
+    void NoteImportedSource(const GuestTextureResource& source) {
+        if (target.format != VK_FORMAT_R32_SFLOAT) return;
+        ValidateImportedSource(source);
+        importedSource = source;
+        if (importedBytes.empty()) {
+            importedBytes.resize(static_cast<std::size_t>(MultisampledColorBytes(target)));
+            std::memcpy(importedBytes.data(), reinterpret_cast<const void*>(target.address), importedBytes.size());
+        }
+        importedMetadata.resize(static_cast<std::size_t>(htileBytes));
+        if (!importedMetadata.empty()) std::memcpy(importedMetadata.data(), reinterpret_cast<const void*>(htileAddress), importedMetadata.size());
+    }
+
+    bool MatchesImportedTexture(const GuestTextureResource& source) const {
+        if (!importedSource) return MatchesImportedMemory();
+        if (!matchesImportLayout(source)) {
+            Require(!hostOnly->load(std::memory_order_acquire), "another layout or metadata interpretation of a host-written imported multisample texture is not implemented");
+            return false;
+        }
+        return MatchesImportedMemory();
+    }
+
+    void RequireImportedDrawCompatible(const ColorTarget& requested) const {
+        if (!importedSource) return;
+        Require(requested.tileMode == target.tileMode && requested.pipeBankXor == target.pipeBankXor && requested.elementBytes == target.elementBytes && requested.mipCount == target.mipCount && requested.mip == target.mip && requested.mipTail == target.mipTail && requested.layers == target.layers && requested.arraySlice == target.arraySlice && requested.arrayLastSlice == target.arrayLastSlice && requested.depth == target.depth && requested.depthSlice == target.depthSlice, "drawing an imported multisample texture through another guest layout is not implemented");
+        Require(importedSource->dccAddress == 0u && requested.dccAddress == 0u, "drawing an imported multisample texture through another metadata interpretation is not implemented");
+        Require(MatchesImportedMemory(), "drawing an imported multisample texture after its guest contents changed requires a fresh initial draw import");
+    }
+
+    bool MatchesImportedMemory() const {
+        if (hostOnly->load(std::memory_order_acquire)) {
+            if (!importedMetadata.empty()) {
+                GuestMemory::FlushGpuWrites(htileAddress, importedMetadata.size());
+                Require(active->load(std::memory_order_acquire) && GuestMemory::Accessible(reinterpret_cast<const void*>(htileAddress), importedMetadata.size()) && std::memcmp(importedMetadata.data(), reinterpret_cast<const void*>(htileAddress), importedMetadata.size()) == 0, "HTILE changed over a host-written imported multisample texture without a modeled metadata transition");
+            }
+            return true;
+        }
+        if (importedBytes.empty()) return true;
+        GuestMemory::FlushGpuWrites(target.address, importedBytes.size());
+        if (!active->load(std::memory_order_acquire) || !GuestMemory::Accessible(reinterpret_cast<const void*>(target.address), importedBytes.size()) || std::memcmp(importedBytes.data(), reinterpret_cast<const void*>(target.address), importedBytes.size()) != 0) return false;
+        if (importedMetadata.empty()) return true;
+        GuestMemory::FlushGpuWrites(htileAddress, importedMetadata.size());
+        return active->load(std::memory_order_acquire) && GuestMemory::Accessible(reinterpret_cast<const void*>(htileAddress), importedMetadata.size()) && std::memcmp(importedMetadata.data(), reinterpret_cast<const void*>(htileAddress), importedMetadata.size()) == 0;
+    }
+
+    void NoteImportedHtileClear() {
+        if (importedSource) std::fill(importedMetadata.begin(), importedMetadata.end(), std::byte{});
+    }
+
     ~MultisampleTarget() { release(); }
     MultisampleTarget(const MultisampleTarget&) = delete;
     MultisampleTarget& operator=(const MultisampleTarget&) = delete;
@@ -296,7 +373,7 @@ public:
         for (auto& [key, texture] : textures) retiredTextures.push_back(std::move(texture));
         textures.clear();
         retired.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, std::exchange(twinView, VK_NULL_HANDLE)});
-        retired.push_back({image, memory, view});
+        retired.push_back({image, memory, view, allocationBytes});
         image = storable.image;
         memory = storable.memory;
         view = storable.view;
@@ -330,7 +407,7 @@ public:
     void Keep() {
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Device() == context.device) {
             recorder->Keep(shared_from_this());
-            recorder->KeepBytes(this, allocationBytes);
+            recorder->KeepBytes(this, allocationBytes + importedBytes.size() + importedMetadata.size() + (importedUpload ? importedUpload->Bytes().size() : 0u));
         }
     }
 
@@ -377,6 +454,12 @@ public:
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
             if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::Draw, 1);
         });
+    }
+
+    std::pair<VkDeviceSize, VkDeviceSize> ProfileAllocationBytes() const {
+        VkDeviceSize old = 0;
+        for (const auto& allocation : retired) old += allocation.bytes;
+        return {allocationBytes - old, old};
     }
 
     VkImageView Storage(VkFormat format, bool uintStorage) {
@@ -561,6 +644,11 @@ private:
     std::vector<Allocation> retired;
     VkImageView storageView = VK_NULL_HANDLE;
     VkImageView uintStorageView = VK_NULL_HANDLE;
+    std::vector<std::byte> importedBytes;
+    std::optional<GuestTextureResource> importedSource;
+    std::vector<std::byte> importedMetadata;
+    std::unique_ptr<Buffer> importedUpload;
+    VkImageView importedView = VK_NULL_HANDLE;
     bool storageWritten = false;
     VkDeviceSize allocationBytes = 0;
     std::optional<GuestMemory::UnchangedQuery> fmaskRange;
@@ -634,6 +722,39 @@ private:
         dccCopies.resize(dccRanges.size());
         for (std::size_t index = 0; index < metadata.size(); ++index) dccCopies[index + 1] = comparedMetadata[index] ? comparedCopy(dccRanges[index + 1], std::move(landedBytes[index])) : DccCopy{};
         return true;
+    }
+
+    bool matchesImportLayout(const GuestTextureResource& source) const {
+        const auto& initial = *importedSource;
+        return source.baseAddress == initial.baseAddress && source.width == initial.width && source.height == initial.height && source.format == initial.format && source.samples == initial.samples && source.tileMode == initial.tileMode && source.pipeBankXor == initial.pipeBankXor && source.baseArray == initial.baseArray && source.depthOrLastArray == initial.depthOrLastArray && source.baseLevel == initial.baseLevel && source.lastLevel == initial.lastLevel && source.mipCount == initial.mipCount && source.allocatedMipCount == initial.allocatedMipCount && source.minLod == initial.minLod && source.dccAddress == initial.dccAddress && source.dccAlphaOnMsb == initial.dccAlphaOnMsb && source.dccPipeAligned == initial.dccPipeAligned && source.iterate256 == initial.iterate256 && source.fmaskCmaskAddress == initial.fmaskCmaskAddress;
+    }
+
+    void prepareImport(std::span<const std::byte> source) {
+        Require(target.format == VK_FORMAT_R32_SFLOAT && target.elementBytes == 4u, "nonuniform guest multisample imports require R32F");
+        Require(target.tileMode == ColorTileMode::RenderTarget || target.tileMode == ColorTileMode::Z64KBX, "nonuniform guest multisample imports require R_X or Z_X tiling");
+        Require(target.layers == 1u && target.arraySlice == 0u && target.arrayLastSlice == 0u && target.depth == 1u && target.depthSlice == 0u && target.mipCount == 1u && target.mip == 0u && !target.mipTail, "nonuniform guest multisample subresources are not implemented");
+        Require(context.detiler != nullptr && context.storageImageMultisample && context.storageImageWriteWithoutFormat, "nonuniform guest multisample imports require formatless multisampled storage writes");
+        const auto tile = target.tileMode == ColorTileMode::RenderTarget ? TextureTileMode::kR64KBX : TextureTileMode::kZ64KBX;
+        const MultisampleTextureLayout layout(tile, 4u, target.samples, target.extent.width, target.extent.height, 1u, target.pipeBankXor);
+        Require(layout.Bytes() == source.size() && layout.LinearBytes() / 4u <= std::numeric_limits<std::uint32_t>::max(), "nonuniform guest multisample import footprint is invalid");
+        importedBytes.assign(source.begin(), source.end());
+        importedUpload = std::make_unique<Buffer>(context, static_cast<std::size_t>(layout.LinearBytes()), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        layout.Detile(importedBytes, importedUpload->Bytes());
+    }
+
+    void recordImport(VkCommandBuffer commands, Recorder* recorder) {
+        if (!importedUpload) return;
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4u);
+        const auto stride = context.limits.maxStorageBufferRange / alignment * alignment;
+        Require(stride >= 4u, "nonuniform guest multisample upload cannot bind an aligned element");
+        const auto bytes = importedUpload->Bytes().size();
+        for (std::uint64_t offset = 0; offset < bytes; offset += stride) {
+            const auto count = std::min<std::uint64_t>(stride, bytes - offset);
+            context.detiler->DispatchMultisampleImage(commands, 4u, importedUpload->Handle(), offset, count, importedView, target.extent.width, target.extent.height, 1u, target.samples, static_cast<std::uint32_t>(offset / 4u), static_cast<std::uint32_t>(count / 4u));
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
     }
 
     VkClearColorValue initialDccClear(const ColorTarget& use) {
@@ -751,6 +872,7 @@ private:
         if (twinView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, twinView, nullptr);
         if (storageView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, storageView, nullptr);
         if (uintStorageView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, uintStorageView, nullptr);
+        if (importedView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, importedView, nullptr);
         destroy({image, memory, view});
         for (const auto& allocation : retired) destroy(allocation);
     }
@@ -870,6 +992,29 @@ std::vector<std::shared_ptr<MultisampleTarget>>& targets() {
     return list;
 }
 
+void profileColorLifetimes(const Context& context) {
+    static const bool enabled = std::getenv("APS5_PROFILE_RESOURCE_LIFETIMES") != nullptr;
+    if (!enabled || targets().empty()) return;
+    static auto last = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (last != std::chrono::steady_clock::time_point{} && now - last < std::chrono::seconds(10)) return;
+    last = now;
+    struct Totals { std::size_t count = 0; std::uint64_t current = 0; std::uint64_t old = 0; };
+    std::array<Totals, 2> totals{};
+    for (const auto& target : targets()) {
+        if (target->context.device != context.device) continue;
+        auto& entry = totals[target->active->load(std::memory_order_acquire) ? 0u : 1u];
+        const auto [current, old] = target->ProfileAllocationBytes();
+        ++entry.count;
+        entry.current += current;
+        entry.old += old;
+    }
+    for (std::size_t i = 0; i < totals.size(); ++i) {
+        const auto& entry = totals[i];
+        std::fprintf(stderr, "[resource-lifetimes] multisample-color %s: %zu targets, current %llu bytes, retained-old %llu bytes (Vulkan allocations, heap unspecified)\n", i == 0 ? "active" : "inactive", entry.count, static_cast<unsigned long long>(entry.current), static_cast<unsigned long long>(entry.old));
+    }
+}
+
 void discardRetiredTargets() {
     std::erase_if(targets(), [](const auto& target) { return !target->active->load(std::memory_order_acquire); });
 }
@@ -882,10 +1027,12 @@ bool holdHostOnly(const MultisampleTarget& target) {
 }
 
 MultisampleTarget& acquire(const Context& context, const ColorTarget& requested) {
+    profileColorLifetimes(context);
     discardRetiredTargets();
     for (const auto& target : targets()) {
         if (!target->active->load(std::memory_order_acquire)) continue;
         if (target->context.device != context.device || !target->Serves(requested)) continue;
+        target->RequireImportedDrawCompatible(requested);
         auto use = requested;
         use.format = target->target.format;
         if (recreated(target->target, use)) {
@@ -920,6 +1067,7 @@ MultisampleTarget& acquire(const Context& context, const ColorTarget& requested)
     auto target = std::make_shared<MultisampleTarget>(context, use);
     target->Keep();
     targets().push_back(std::move(target));
+    profileColorLifetimes(context);
     auto& created = *targets().back();
     guard(context, use, created.active, created.metadataValid, created.hostOnly);
     if (use.cmaskFastClear && use.dccAddress == 0) created.cmask.SeedCode(CurrentUniformMetadataByte(use.cmaskAddress, static_cast<std::size_t>(use.cmaskBytes)));
@@ -929,6 +1077,7 @@ MultisampleTarget& acquire(const Context& context, const ColorTarget& requested)
 }
 
 MultisampleTarget& createFilled(const Context& context, const GuestTextureResource& resource, VkFormat format, const char* access, bool written) {
+    if (format == VK_FORMAT_R32_SFLOAT) MultisampleTarget::ValidateImportedSource(resource);
     const auto refuse = [&](const std::string& reason) {
         char text[192];
         std::snprintf(text, sizeof(text), "AGC graphics: %s the %ux%u multisampled texture 0x%llx of %u samples, which no draw rendered to and ", access, resource.width, resource.height, static_cast<unsigned long long>(resource.baseAddress), resource.samples);
@@ -984,23 +1133,26 @@ MultisampleTarget& createFilled(const Context& context, const GuestTextureResour
     char held[16];
     std::snprintf(held, sizeof(held), "0x%08x", value);
     const auto repeated = htileCleared ? memory + bytes : std::mismatch(memory + sizeof(value), memory + bytes, memory).first;
-    if (repeated != memory + bytes) {
+    const bool imported = repeated != memory + bytes && use.format == VK_FORMAT_R32_SFLOAT && (use.tileMode == ColorTileMode::RenderTarget || use.tileMode == ColorTileMode::Z64KBX);
+    if (repeated != memory + bytes && !imported) {
         char offset[32];
         std::snprintf(offset, sizeof(offset), "+0x%llx", static_cast<unsigned long long>(repeated - memory));
         refuse(std::string("whose color memory ") + range + " does not hold one repeated 32-bit value (" + held + " until " + offset + ")");
     }
     VkClearColorValue clear{};
-    if (!MultisampledFillClearColor(use, value, clear)) refuse(std::string("whose color memory ") + range + " holds " + held + ", which has no exact clear value in its format");
-    auto target = std::make_shared<MultisampleTarget>(context, use);
+    if (!imported && !MultisampledFillClearColor(use, value, clear)) refuse(std::string("whose color memory ") + range + " holds " + held + ", which has no exact clear value in its format");
+    auto target = std::make_shared<MultisampleTarget>(context, use, imported ? std::span(memory, static_cast<std::size_t>(bytes)) : std::span<const std::byte>{});
     target->Keep();
     targets().push_back(std::move(target));
+    profileColorLifetimes(context);
     auto& created = *targets().back();
     created.hostOnly->store(written, std::memory_order_release);
     guard(context, use, created.active, created.metadataValid, created.hostOnly);
-    created.colorFill.NoteFill(use.address, static_cast<std::size_t>(bytes), value);
+    if (!imported) created.colorFill.NoteFill(use.address, static_cast<std::size_t>(bytes), value);
     created.fromTexture = true;
     created.htileAddress = resource.dccAddress;
     created.htileBytes = htileBytes;
+    created.NoteImportedSource(resource);
     return created;
 }
 
@@ -1282,12 +1434,17 @@ bool sameStorageForm(const Context& context, VkFormat rendered, VkFormat request
 
 std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType) {
     std::lock_guard lock(targetsMutex());
+    profileColorLifetimes(context);
     discardRetiredTargets();
     const auto format = ResolveTextureFormat(resource.format);
     const MultisampleTarget* other = nullptr;
     for (const auto& target : targets()) {
         if (!target->active->load(std::memory_order_acquire)) continue;
         if (target->context.device != context.device || target->target.surfaceAddress != resource.baseAddress) continue;
+        if (!target->MatchesImportedTexture(resource)) {
+            target->active->store(false, std::memory_order_release);
+            continue;
+        }
         const auto& rendered = target->target;
         const bool sameShape = rendered.extent.width == resource.width && rendered.extent.height == resource.height && rendered.samples == resource.samples && rendered.mip == 0;
         if (sameShape && rendered.format == format) return target->Sampled(components, viewType);
@@ -1305,12 +1462,17 @@ std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const 
 
 std::shared_ptr<Texture> MultisampleTargetFirstSample(const Context& context, const GuestTextureResource& resource, VkComponentMapping components) {
     std::lock_guard lock(targetsMutex());
+    profileColorLifetimes(context);
     discardRetiredTargets();
     const auto format = ResolveTextureFormat(resource.format);
     const MultisampleTarget* other = nullptr;
     for (const auto& target : targets()) {
         if (!target->active->load(std::memory_order_acquire)) continue;
         if (target->context.device != context.device || target->target.surfaceAddress != resource.baseAddress) continue;
+        if (!target->MatchesImportedTexture(resource)) {
+            target->active->store(false, std::memory_order_release);
+            continue;
+        }
         const auto& rendered = target->target;
         const bool sameShape = rendered.extent.width == resource.width && rendered.extent.height == resource.height && rendered.samples == resource.samples && rendered.mip == 0;
         if (sameShape && rendered.format == format) return target->FirstSample(components);
@@ -1333,12 +1495,17 @@ void MaterializeMultisampleTargetClear(const Context& context, const ColorTarget
 
 VkImageView MultisampleTargetStorageView(const Context& context, const GuestTextureResource& resource, bool uintStorage) {
     std::lock_guard lock(targetsMutex());
+    profileColorLifetimes(context);
     discardRetiredTargets();
     const auto format = ResolveTextureFormat(resource.format);
     const MultisampleTarget* other = nullptr;
     for (const auto& target : targets()) {
         if (!target->active->load(std::memory_order_acquire)) continue;
         if (target->context.device != context.device || target->target.surfaceAddress != resource.baseAddress) continue;
+        if (!target->MatchesImportedTexture(resource)) {
+            target->active->store(false, std::memory_order_release);
+            continue;
+        }
         const auto& rendered = target->target;
         if (sameStorageForm(context, rendered.format, format) && rendered.extent.width == resource.width && rendered.extent.height == resource.height && rendered.samples == resource.samples && rendered.mip == 0) {
             if (!holdHostOnly(*target)) continue;
@@ -1405,6 +1572,7 @@ void NoteColorMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
         if (target->htileBytes != 0 && address < target->htileAddress + target->htileBytes && target->htileAddress < address + bytes) {
             if (pattern == 0u && address <= target->htileAddress && address + bytes >= target->htileAddress + target->htileBytes) {
                 target->htileRefusal.clear();
+                target->NoteImportedHtileClear();
                 target->colorFill.NoteFill(target->target.address, static_cast<std::size_t>(MultisampledColorBytes(target->target)), 0u);
             } else {
                 char text[224];
@@ -1426,6 +1594,7 @@ void NoteColorMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
 
 std::shared_ptr<Texture> MultisampleTargetFmaskTexture_nid_no_patch(const Context& context, const GuestTextureResource& resource, VkComponentMapping components) {
     std::lock_guard lock(targetsMutex());
+    profileColorLifetimes(context);
     discardRetiredTargets();
     std::shared_ptr<MultisampleTarget> owner;
     for (const auto& candidate : targets()) {

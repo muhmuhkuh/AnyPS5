@@ -43,6 +43,15 @@ struct MockDevice {
     std::uint64_t next = 1;
     std::map<VkBuffer, VkDeviceSize> sizes;
     std::map<VkBuffer, VkBufferUsageFlags> usages;
+    std::map<VkBuffer, std::uint32_t> bufferMemoryTypeBits;
+    std::map<VkBuffer, VkDeviceSize> bufferRequirementSizes;
+    std::map<VkBuffer, VkDeviceSize> bufferRequirementAlignments;
+    std::uint32_t nextBufferMemoryTypeBits = 3u;
+    VkDeviceSize nextBufferRequirementSize = 0;
+    VkDeviceSize nextBufferRequirementAlignment = 256;
+    bool missingBufferRequirementsProc = false;
+    unsigned createdBuffers = 0;
+    unsigned invalidRequirementBinds = 0;
     std::map<VkDeviceMemory, std::vector<std::byte>> hostMemory;
     std::uint64_t allocations = 0;
     std::uint64_t frees = 0;
@@ -59,6 +68,8 @@ struct MockDevice {
     VkResult mapResult = VK_SUCCESS;
     VkResult bindResult = VK_SUCCESS;
     unsigned binds = 0;
+    unsigned incompatibleBinds = 0;
+    bool mapHostType0 = false;
     unsigned maps = 0;
     unsigned unmaps = 0;
 };
@@ -67,14 +78,20 @@ MockDevice mock;
 
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateBuffer(VkDevice, const VkBufferCreateInfo* info, const VkAllocationCallbacks*, VkBuffer* buffer) {
     *buffer = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(mock.next++));
+    ++mock.createdBuffers;
     mock.sizes[*buffer] = info->size;
     mock.usages[*buffer] = info->usage;
+    mock.bufferMemoryTypeBits[*buffer] = mock.nextBufferMemoryTypeBits;
+    mock.bufferRequirementSizes[*buffer] = mock.nextBufferRequirementSize != 0 ? mock.nextBufferRequirementSize : info->size;
+    mock.bufferRequirementAlignments[*buffer] = mock.nextBufferRequirementAlignment;
+    mock.nextBufferRequirementSize = 0;
+    mock.nextBufferRequirementAlignment = 256;
     mock.liveBuffers.insert(*buffer);
     return VK_SUCCESS;
 }
 
 VKAPI_ATTR void VKAPI_CALL mockGetBufferMemoryRequirements(VkDevice, VkBuffer buffer, VkMemoryRequirements* requirements) {
-    *requirements = {mock.sizes.at(buffer), 256, 3};
+    *requirements = {mock.bufferRequirementSizes.at(buffer), mock.bufferRequirementAlignments.at(buffer), mock.bufferMemoryTypeBits.at(buffer)};
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks*, VkDeviceMemory* memory) {
@@ -90,7 +107,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAlloca
         return result;
     }
     *memory = reinterpret_cast<VkDeviceMemory>(static_cast<std::uintptr_t>(mock.next++));
-    if (info->memoryTypeIndex == 1) mock.hostMemory[*memory].resize(info->allocationSize);
+    if (info->memoryTypeIndex == 1 || (info->memoryTypeIndex == 0 && mock.mapHostType0)) mock.hostMemory[*memory].resize(info->allocationSize);
     mock.memoryBytes[*memory] = info->allocationSize;
     mock.memoryTypes[*memory] = info->memoryTypeIndex;
     mock.liveBytes += info->allocationSize;
@@ -101,7 +118,22 @@ VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAlloca
 VKAPI_ATTR VkResult VKAPI_CALL mockBindBufferMemory(VkDevice, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset) {
     ++mock.binds;
     if (mock.bindResult != VK_SUCCESS) return mock.bindResult;
-    if (offset + mock.sizes.at(buffer) > mock.memoryBytes.at(memory)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    const auto memoryType = mock.memoryTypes.at(memory);
+    if (memoryType >= 32u || (mock.bufferMemoryTypeBits.at(buffer) & (std::uint32_t{1} << memoryType)) == 0) {
+        ++mock.incompatibleBinds;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+    const auto& requirements = mock.bufferRequirementSizes.at(buffer);
+    const auto available = mock.memoryBytes.at(memory);
+    if (offset > available || requirements > available - offset) {
+        ++mock.invalidRequirementBinds;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+    const auto alignment = mock.bufferRequirementAlignments.at(buffer);
+    if (alignment != 0 && offset % alignment != 0) {
+        ++mock.invalidRequirementBinds;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     mock.bound[buffer] = {memory, offset};
     return VK_SUCCESS;
 }
@@ -149,6 +181,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkFreeMemory", reinterpret_cast<PFN_vkVoidFunction>(mockFreeMemory)},
         {"vkGetBufferDeviceAddressKHR", reinterpret_cast<PFN_vkVoidFunction>(mockGetBufferDeviceAddress)},
     };
+    if (mock.missingBufferRequirementsProc && std::string_view(name) == "vkGetBufferMemoryRequirements") return nullptr;
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;
 }
@@ -163,6 +196,7 @@ VkDeviceSize ClassOf(VkBuffer buffer) {
 
 Context mockContext() {
     Context context{};
+    context.device = reinterpret_cast<VkDevice>(std::uintptr_t{0x1234});
     context.deviceProc = mockProc;
     context.memory.memoryTypeCount = 2;
     context.memory.memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -414,7 +448,7 @@ void Budget() {
     Expect(MemoryOf(probe.Handle()) != first, "the least recently used device buffer survived the eviction");
 }
 
-void AddressAndHostUnchanged() {
+void AddressAndHostClasses() {
     mock = MockDevice{};
     auto context = mockContext();
     VkDeviceMemory scratch = VK_NULL_HANDLE;
@@ -426,17 +460,148 @@ void AddressAndHostUnchanged() {
     Expect(MemoryOf(addressed.Handle()) != scratch && addressed.DeviceAddress() != 0, "an addressable device-local buffer took a scratch buffer without a device address");
     Buffer shadow(context, 2 * MiB - 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     Expect(MemoryOf(shadow.Handle()) == scratch, "a device-local staging buffer did not share the scratch buffers' class");
-    VkBuffer host = VK_NULL_HANDLE;
+    VkDeviceMemory host = VK_NULL_HANDLE;
     {
         Buffer copy(context, 10 * MiB + 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible);
-        host = copy.Handle();
-        Expect(mock.sizes.at(host) == 10 * MiB + 4096, "a large host buffer was rounded to a class");
-        Expect(mock.usages.at(host) == VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "a host buffer was created with more usages than asked");
+        host = MemoryOf(copy.Handle());
+        Expect(mock.sizes.at(copy.Handle()) == 10 * MiB + 4096, "a large host VkBuffer did not keep its requested size");
+        Expect(ClassOf(copy.Handle()) == 11 * MiB, "a 10 MiB + 4 KiB host buffer did not use its 11 MiB backing class");
+        Expect(copy.Bytes().size() == 10 * MiB + 4096, "a host mapping exposed class capacity rather than requested size");
+        Expect(mock.usages.at(copy.Handle()) == VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "a host buffer was created with more usages than asked");
     }
-    Buffer other(context, 10 * MiB + 8192, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible);
-    Expect(other.Handle() != host, "a large host buffer of another exact size was reused");
-    Buffer same(context, 10 * MiB + 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible);
-    Expect(same.Handle() == host, "a large host buffer of the same exact size was not reused");
+    const auto made = mock.allocations;
+    {
+        Buffer other(context, 10 * MiB + 8192, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible);
+        Expect(MemoryOf(other.Handle()) == host && mock.allocations == made, "a retained 11 MiB host slot did not serve another request in its class");
+        Expect(mock.sizes.at(other.Handle()) == 10 * MiB + 8192 && other.Bytes().size() == 10 * MiB + 8192, "a reused host slot did not keep the new requested VkBuffer size");
+    }
+    Buffer larger(context, 11 * MiB + 4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HostVisible);
+    Expect(MemoryOf(larger.Handle()) != host && mock.allocations == made + 1, "a host request used a slot from a smaller capacity class");
+    Expect(mock.sizes.at(larger.Handle()) == 11 * MiB + 4096, "a larger-class host buffer did not keep its requested size");
+    Expect(BufferPool::Capacity(std::numeric_limits<std::size_t>::max()) == std::numeric_limits<std::size_t>::max(), "host capacity rounding overflowed at the largest size");
+}
+
+void BufferClassMemoryTypeCompatibility() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    context.memory.memoryTypes[0].propertyFlags = HostVisible;
+    mock.mapHostType0 = true;
+    constexpr auto usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    constexpr auto oldSize = 10 * MiB + 4096;
+    constexpr auto newSize = 10 * MiB + 8192;
+    mock.nextBufferMemoryTypeBits = std::uint32_t{1} << 1u;
+    VkDeviceMemory oldMemory = VK_NULL_HANDLE;
+    {
+        Buffer old(context, oldSize, usage, HostVisible);
+        oldMemory = MemoryOf(old.Handle());
+        Expect(mock.memoryTypes.at(oldMemory) == 1u, "the old host slot was not allocated from memory type 1");
+    }
+    const auto bindsBefore = mock.binds;
+    const auto allocationsBefore = mock.allocations;
+    mock.nextBufferMemoryTypeBits = std::uint32_t{1} << 0u;
+    VkDeviceMemory newMemory = VK_NULL_HANDLE;
+    {
+        Buffer current(context, newSize, usage, HostVisible);
+        newMemory = MemoryOf(current.Handle());
+        Expect(newMemory != oldMemory && mock.memoryTypes.at(newMemory) == 0u, "an incompatible class slot was reused instead of allocating from the requested memory type");
+        Expect(mock.sizes.at(current.Handle()) == newSize && current.Bytes().size() == newSize, "memory-type fallback changed the requested buffer size");
+    }
+    Expect(mock.incompatibleBinds == 0u, "the class fallback attempted vkBindBufferMemory with an excluded memory type");
+    Expect(mock.binds == bindsBefore + 1u && mock.allocations == allocationsBefore + 1u, "the incompatible-slot fallback did not perform exactly one valid fresh bind and allocation");
+    const auto afterFallbackAllocations = mock.allocations;
+    mock.nextBufferMemoryTypeBits = std::uint32_t{1} << 1u;
+    {
+        Buffer oldAgain(context, oldSize, usage, HostVisible);
+        Expect(MemoryOf(oldAgain.Handle()) == oldMemory && mock.allocations == afterFallbackAllocations, "the incompatible slot was lost instead of remaining available for its original memory type");
+    }
+    Expect(mock.incompatibleBinds == 0u, "a retained slot was ever bound with an incompatible memory type");
+}
+
+
+void BufferClassRequirementSizeGuard() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    constexpr auto usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    constexpr std::size_t oldSize = 10 * MiB + 4096;
+    constexpr std::size_t newSize = 10 * MiB + 8192;
+    const auto oldClass = BufferPool::Capacity(oldSize);
+    VkDeviceMemory oldMemory = VK_NULL_HANDLE;
+    {
+        Buffer old(context, oldSize, usage, HostVisible);
+        oldMemory = MemoryOf(old.Handle());
+    }
+    const auto allocationsBefore = mock.allocations;
+    const auto bindsBefore = mock.binds;
+    mock.nextBufferRequirementSize = oldClass + 1;
+    {
+        Buffer current(context, newSize, usage, HostVisible);
+        Expect(MemoryOf(current.Handle()) != oldMemory, "a request larger than the retained allocation reused that slot");
+        Expect(mock.sizes.at(current.Handle()) == newSize && current.Bytes().size() == newSize, "requirements-size fallback changed the requested buffer size");
+    }
+    Expect(mock.allocations == allocationsBefore + 1 && mock.binds == bindsBefore + 1, "requirements-size rejection did not take the fresh-allocation path");
+    Expect(mock.invalidRequirementBinds == 0, "a buffer was bound despite requirements exceeding the available allocation");
+    {
+        Buffer oldAgain(context, oldSize, usage, HostVisible);
+        Expect(MemoryOf(oldAgain.Handle()) == oldMemory, "the incompatible size slot was not retained for its original request");
+    }
+}
+
+void BufferClassRequirementAlignmentGuard() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    context.limits.nonCoherentAtomSize = 64;
+    constexpr auto slabUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    VkDeviceMemory slabMemory = VK_NULL_HANDLE;
+    {
+        Buffer anchor(context, 300, slabUsage, HostVisible);
+        {
+            Buffer old(context, 300, slabUsage, HostVisible);
+            slabMemory = MemoryOf(old.Handle());
+            Expect(mock.bound.at(old.Handle()).second == 512, "the misalignment fixture did not select a nonzero slab offset");
+        }
+        const auto allocationsBefore = mock.allocations;
+        const auto bindsBefore = mock.binds;
+        mock.nextBufferRequirementAlignment = 1024;
+        {
+            Buffer current(context, 260, slabUsage, HostVisible);
+            Expect(MemoryOf(current.Handle()) != slabMemory, "a misaligned slab slot was reused");
+            Expect(mock.sizes.at(current.Handle()) == 260 && current.Bytes().size() == 260, "alignment fallback changed the requested buffer size");
+        }
+        Expect(mock.allocations == allocationsBefore + 1 && mock.binds == bindsBefore + 1, "alignment rejection did not use one fresh bind and allocation");
+        Expect(mock.invalidRequirementBinds == 0, "an offset violating VkMemoryRequirements.alignment reached vkBindBufferMemory");
+        {
+            Buffer oldAgain(context, 300, slabUsage, HostVisible);
+            Expect(MemoryOf(oldAgain.Handle()) == slabMemory && mock.bound.at(oldAgain.Handle()).second == 512, "the misaligned slot was lost instead of remaining available to its original request");
+        }
+    }
+}
+
+void ProbeCleanup() {
+    mock = MockDevice{};
+    auto context = mockContext();
+    constexpr auto usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    mock.missingBufferRequirementsProc = true;
+    bool resolutionFailed = false;
+    try {
+        Buffer probe(context, 2 * MiB, usage, HostVisible);
+    } catch (const std::exception&) {
+        resolutionFailed = true;
+    }
+    Expect(resolutionFailed, "a missing requirements function did not fail buffer creation");
+    Expect(mock.createdBuffers == 0 && mock.liveBuffers.empty(), "the probe was created before resolving its requirements function");
+
+    mock.missingBufferRequirementsProc = false;
+    mock.results.push_back(VK_ERROR_DEVICE_LOST);
+    const auto createdBefore = mock.createdBuffers;
+    const auto destroyedBefore = mock.destroyedBuffers;
+    bool allocationFailed = false;
+    try {
+        Buffer probe(context, 2 * MiB, usage, HostVisible);
+    } catch (const std::exception&) {
+        allocationFailed = true;
+    }
+    Expect(allocationFailed, "the injected allocation failure did not propagate");
+    Expect(mock.createdBuffers == createdBefore + 1 && mock.destroyedBuffers == destroyedBefore + 1 && mock.liveBuffers.empty(), "an allocation failure leaked the requested-size probe");
 }
 
 void SmallDeviceClasses() {
@@ -702,6 +867,8 @@ struct ReclaimMock {
     VkDeviceSize externalBytes = 0;
     std::uint64_t requests = 0;
     VkDeviceSize asked = 0;
+    VkDevice expectedDevice = VK_NULL_HANDLE;
+    VkDevice receivedDevice = VK_NULL_HANDLE;
     bool newImage = false;
 };
 
@@ -717,14 +884,21 @@ VkDeviceMemory ExternalAllocation(VkDeviceSize bytes) {
     return memory;
 }
 
-VkDeviceSize mockCacheReclaim(VkDeviceSize bytes, bool newImage) {
+VkDeviceSize mockCacheReclaim(VkDeviceSize bytes, bool newImage, VkDevice device) {
     Expect(newImage == reclaimMock.newImage, "an allocation used the wrong image-creation cache access");
+    reclaimMock.receivedDevice = device;
+    Expect(device != VK_NULL_HANDLE, "the cache-reclaim callback did not forward VkDevice");
+    Expect(device == reclaimMock.expectedDevice, "the cache-reclaim callback received the wrong VkDevice");
     ++reclaimMock.requests;
     reclaimMock.asked = bytes;
     if (reclaimMock.external == VK_NULL_HANDLE) return 0;
     mockFreeMemory(VK_NULL_HANDLE, reclaimMock.external, nullptr);
     reclaimMock.external = VK_NULL_HANDLE;
     return reclaimMock.externalBytes;
+}
+
+VkDeviceSize mockCacheReclaim(VkDeviceSize bytes, bool newImage) {
+    return mockCacheReclaim(bytes, newImage, VK_NULL_HANDLE);
 }
 
 void CacheReclaimRecovery() {
@@ -739,6 +913,7 @@ void CacheReclaimRecovery() {
     reclaimMock = ReclaimMock{};
     {
         auto context = mockContext();
+        reclaimMock.expectedDevice = context.device;
         context.cacheReclaim = mockCacheReclaim;
         { DeviceBuffer idle(context, 2 * MiB, usage); }
         ExternalAllocation(10 * MiB);
@@ -758,6 +933,7 @@ void CacheReclaimRecovery() {
     reclaimMock = ReclaimMock{};
     {
         auto context = mockContext();
+        reclaimMock.expectedDevice = context.device;
         context.cacheReclaim = mockCacheReclaim;
         ExternalAllocation(10 * MiB);
         mock.limit = 12 * MiB;
@@ -774,6 +950,7 @@ void CacheReclaimRecovery() {
     reclaimMock = ReclaimMock{};
     {
         auto context = mockContext();
+        reclaimMock.expectedDevice = context.device;
         context.cacheReclaim = mockCacheReclaim;
         mock.limit = 2 * MiB;
         const auto before = mock.attempts;
@@ -802,6 +979,8 @@ void ImageCacheReclaim() {
     mock = MockDevice{};
     reclaimMock = ReclaimMock{};
     auto context = budgetContext();
+    context.device = reinterpret_cast<VkDevice>(std::uintptr_t{0x5678});
+    reclaimMock.expectedDevice = context.device;
     context.cacheReclaim = mockCacheReclaim;
     reportedBudget = 1620 * MiB;
     reportedUsage = 200 * MiB;
@@ -1035,16 +1214,23 @@ void DeviceBindingFailures() {
 VkDeviceMemory reclaimImage = VK_NULL_HANDLE;
 const Context* reclaimImageContext = nullptr;
 
-VkDeviceSize mockImageReclaim(VkDeviceSize, bool) {
+VkDeviceSize mockImageReclaim(VkDeviceSize, bool, VkDevice device) {
+    Expect(reclaimImageContext != nullptr && device != VK_NULL_HANDLE, "the image cache-reclaim callback did not forward VkDevice");
+    Expect(device == reclaimImageContext->device, "the image cache-reclaim callback received the wrong VkDevice");
     if (reclaimImage == VK_NULL_HANDLE) return 0;
     ReleaseImageMemory(*reclaimImageContext, reclaimImage, 10 * MiB, 0);
     reclaimImage = VK_NULL_HANDLE;
     return 10 * MiB;
 }
 
+VkDeviceSize mockImageReclaim(VkDeviceSize bytes, bool newImage) {
+    return mockImageReclaim(bytes, newImage, VK_NULL_HANDLE);
+}
+
 void ImageMemoryReclaim() {
     mock = MockDevice{};
     auto context = mockContext();
+    context.device = reinterpret_cast<VkDevice>(std::uintptr_t{0x9abc});
     context.cacheReclaim = mockImageReclaim;
     reclaimImageContext = &context;
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -1198,7 +1384,11 @@ int main(int argc, char** argv) {
         KeptUntilFence();
         SmallDeviceRetention();
         Budget();
-        AddressAndHostUnchanged();
+        AddressAndHostClasses();
+        BufferClassMemoryTypeCompatibility();
+        BufferClassRequirementSizeGuard();
+        BufferClassRequirementAlignmentGuard();
+        ProbeCleanup();
         SmallDeviceClasses();
         SlabMetadataFailure();
         SlabMapFailure();

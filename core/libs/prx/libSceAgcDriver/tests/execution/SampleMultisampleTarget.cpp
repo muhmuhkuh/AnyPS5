@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTextureLayout.hpp"
+#include "IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -943,6 +945,115 @@ void NativeFmask(std::unique_ptr<AgcDriver::VulkanDevice>& device) {
     }
 }
 
+int NonuniformMemory(AgcDriver::VulkanDevice& device) {
+    using namespace AgcDriver::Graphics;
+    const auto format = static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format32Float);
+    std::uint32_t cases = 0;
+    for (const auto mode : {TileRenderTarget, TileZ64KBX}) {
+        for (std::uint32_t shift = 1; shift <= 3; ++shift) {
+            const auto samples = 1u << shift;
+            const auto tile = mode == TileRenderTarget ? TextureTileMode::kR64KBX : TextureTileMode::kZ64KBX;
+            const MultisampleTextureLayout layout(tile, 4u, samples, Side, Side, 1u);
+            Block memory(static_cast<std::size_t>(layout.Bytes()));
+            std::vector<std::uint32_t> linear(Side * Side * samples);
+            std::vector<std::byte> tiled(static_cast<std::size_t>(layout.Bytes()));
+            const auto descriptor = TargetDescriptor(memory, shift, format, mode);
+            for (std::uint32_t version = 0; version < 2; ++version) {
+                std::vector<std::array<float, 4>> expected(linear.size());
+                for (std::uint32_t i = 0; i < linear.size(); ++i) {
+                    const float value = static_cast<float>((i % 127u) + 1u + version * 128u) / 512.0f;
+                    linear[i] = std::bit_cast<std::uint32_t>(value);
+                    expected[i] = {value, 0.0f, 0.0f, 1.0f};
+                }
+                layout.Tile(std::as_bytes(std::span(linear)), tiled);
+                AgcDriver::GuestMemory::Write(memory.Address(), tiled);
+                const auto loaded = LoadSamples(device, descriptor, samples);
+                Require(loaded == expected, "nonuniform R32F multisample memory lost a pixel or sample, or reused stale guest contents");
+                const auto repeated = LoadSamples(device, descriptor, samples);
+                Require(repeated == expected, "nonuniform R32F multisample memory changed on a repeated read");
+            }
+            const auto expectedLayout = [&](TextureTileMode requestedTile, std::uint32_t xorBits) {
+                const MultisampleTextureLayout requested(requestedTile, 4u, samples, Side, Side, 1u, xorBits);
+                Require(requested.Bytes() == tiled.size(), "the alternate multisample layout needs another footprint");
+                std::vector<std::uint32_t> decoded(linear.size());
+                requested.Detile(tiled, std::as_writable_bytes(std::span(decoded)));
+                std::vector<std::array<float, 4>> expected(decoded.size());
+                for (std::size_t i = 0; i < decoded.size(); ++i) expected[i] = {std::bit_cast<float>(decoded[i]), 0.0f, 0.0f, 1.0f};
+                return expected;
+            };
+            const auto alternateMode = mode == TileRenderTarget ? TileZ64KBX : TileRenderTarget;
+            const auto alternateTile = alternateMode == TileRenderTarget ? TextureTileMode::kR64KBX : TextureTileMode::kZ64KBX;
+            const auto alternate = TargetDescriptor(memory, shift, format, alternateMode);
+            Require(LoadSamples(device, alternate, samples) == expectedLayout(alternateTile, 0u), "one address sampled through R_X and Z_X reused the first import's pixel interpretation");
+            auto xorDescriptor = descriptor;
+            constexpr std::uint32_t xorBits = 0x4000u;
+            xorDescriptor[0] |= xorBits >> 8u;
+            const auto xorExpected = expectedLayout(tile, xorBits);
+            Require(xorExpected != expectedLayout(tile, 0u), "the multisample XOR control did not change any expected texel");
+            Require(LoadSamples(device, xorDescriptor, samples) == xorExpected, "one address sampled with a different pipe-bank XOR reused stale sample positions");
+            Require(LoadSamples(device, descriptor, samples) == expectedLayout(tile, 0u), "returning to the original multisample layout reused the alternate interpretation");
+            if (mode == TileZ64KBX) {
+                Block expanded(BlockBytes);
+                Block cleared(BlockBytes);
+                std::vector<std::uint32_t> metadata(BlockBytes / sizeof(std::uint32_t), 0xfffc000fu);
+                AgcDriver::GuestMemory::Write(expanded.Address(), std::as_bytes(std::span(metadata)));
+                const auto withMetadata = [&](std::uint64_t address) {
+                    auto result = descriptor;
+                    const auto meta = address >> 8u;
+                    result[6] = (1u << 20u) | (1u << 21u) | (static_cast<std::uint32_t>(meta & 0xffu) << 24u);
+                    result[7] = static_cast<std::uint32_t>(meta >> 8u);
+                    return result;
+                };
+                const auto expandedDescriptor = withMetadata(expanded.Address());
+                const auto clearedDescriptor = withMetadata(cleared.Address());
+                const auto expected = expectedLayout(tile, 0u);
+                const std::vector<std::array<float, 4>> zeros(linear.size(), {0.0f, 0.0f, 0.0f, 1.0f});
+                Require(LoadSamples(device, expandedDescriptor, samples) == expected, "expanded HTILE changed the imported multisample pixels");
+                Require(LoadSamples(device, clearedDescriptor, samples) == zeros, "changing the HTILE base to cleared metadata retained nonuniform imported samples");
+                Require(LoadSamples(device, expandedDescriptor, samples) == expected, "changing the HTILE base back to expanded metadata retained the clear");
+                std::fill(metadata.begin(), metadata.end(), 0u);
+                AgcDriver::GuestMemory::Write(expanded.Address(), std::as_bytes(std::span(metadata)));
+                Require(LoadSamples(device, expandedDescriptor, samples) == zeros, "changing HTILE words without changing its address retained nonuniform imported samples");
+                std::fill(metadata.begin(), metadata.end(), 0xfffc000fu);
+                AgcDriver::GuestMemory::Write(expanded.Address(), std::as_bytes(std::span(metadata)));
+                Require(LoadSamples(device, expandedDescriptor, samples) == expected, "restoring expanded HTILE words retained a cached clear");
+                Require(LoadSamples(device, descriptor, samples) == expected, "removing HTILE from the descriptor retained its cached clear");
+                if (shift == SampleShift) {
+                    const auto oneSample = [](std::uint32_t, std::uint32_t, std::uint32_t sample) { return sample == StoredSample; };
+                    Require(LoadSamples(device, expandedDescriptor, samples) == expected, "the host-write metadata control did not start from the guest samples");
+                    StoreSamples(device, expandedDescriptor, SampleWrites(oneSample));
+                    auto written = expected;
+                    for (std::uint32_t i = 0; i < written.size(); ++i) {
+                        const auto pixel = i / samples;
+                        if (oneSample(pixel % Side, pixel / Side, i % samples)) written[i] = {Written[0], 0.0f, 0.0f, 1.0f};
+                    }
+                    Require(written != expected && LoadSamples(device, expandedDescriptor, samples) == written, "the HTILE control did not retain the real GPU storage writes");
+                    std::fill(metadata.begin(), metadata.end(), 0u);
+                    std::memcpy(expanded.data, metadata.data(), metadata.size() * sizeof(std::uint32_t));
+                    RequireRefused(device, expandedDescriptor, "HTILE changed", "sampling a host-written R32F import after raw CPU HTILE changes");
+                    std::fill(metadata.begin(), metadata.end(), 0xfffc000fu);
+                    std::memcpy(expanded.data, metadata.data(), metadata.size() * sizeof(std::uint32_t));
+                    Require(LoadSamples(device, expandedDescriptor, samples) == written, "refusing a CPU HTILE change discarded the GPU storage writes");
+                    const auto htileSize = static_cast<std::size_t>(HtileMetadataBytes({Side, Side}));
+                    NoteColorMetadataFill(expanded.Address(), htileSize, 0u);
+                    const std::array<std::uint32_t, 4> zeroPattern{};
+                    const bool filledOnGpu = device.FillBuffer(expanded.Address(), htileSize, zeroPattern);
+                    if (!filledOnGpu) {
+                        std::fill(metadata.begin(), metadata.end(), 0u);
+                        AgcDriver::GuestMemory::Write(expanded.Address(), std::as_bytes(std::span(metadata)).first(htileSize));
+                    }
+                    device.WaitIdle();
+                    Require(LoadSamples(device, expandedDescriptor, samples) == zeros, "a declared whole-HTILE zero fill no longer cleared the host-written import");
+                    std::printf("R32F HTILE host-write control: CPU mutation refused without losing GPU writes; whole zero fill GPU=%u passed\n", static_cast<unsigned>(filledOnGpu));
+                }
+            }
+            ++cases;
+        }
+    }
+    std::printf("Nonuniform R32F guest multisample memory: %u R_X/Z_X cases with 2/4/8 samples and guest replacement passed\n", cases);
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -961,6 +1072,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--native-vertex-input") return NativeVertexInput(device);
+        if (argc == 2 && std::string_view(argv[1]) == "--memory") return NonuniformMemory(*device);
         Block block(4u * BlockBytes);
         Block other(BlockBytes);
         const auto color = DecodeTarget(block);

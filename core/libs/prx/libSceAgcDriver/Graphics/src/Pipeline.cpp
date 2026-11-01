@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CpuPhaseStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
@@ -448,6 +449,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : Pipeline(context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout) {}
 
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias), dynamicRendering(context.graphicsPipelineLibrary) {
+    CpuPhaseStats::ScopeTimer phaseTimer(CpuPhaseStats::Phase::PipelineConstruction, true, true);
     PerformanceTimer timing("Vulkan.GraphicsPipeline");
     for (const auto& color : state.colors) boundAttachments.push_back(color.partialWriteMask == 0u);
     if (state.depth) boundAttachments.push_back(true);
@@ -696,6 +698,22 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             blend.logicOpEnable = VK_TRUE;
             blend.logicOp = logicOp;
         }
+        if (!context.independentBlend) {
+            const auto uniform = [](const std::vector<VkPipelineColorBlendAttachmentState>& attachments) {
+                return attachments.empty() || std::ranges::all_of(attachments, [&](const auto& attachment) {
+                    const auto& first = attachments.front();
+                    return attachment.blendEnable == first.blendEnable &&
+                        attachment.srcColorBlendFactor == first.srcColorBlendFactor &&
+                        attachment.dstColorBlendFactor == first.dstColorBlendFactor &&
+                        attachment.colorBlendOp == first.colorBlendOp &&
+                        attachment.srcAlphaBlendFactor == first.srcAlphaBlendFactor &&
+                        attachment.dstAlphaBlendFactor == first.dstAlphaBlendFactor &&
+                        attachment.alphaBlendOp == first.alphaBlendOp &&
+                        attachment.colorWriteMask == first.colorWriteMask;
+                });
+            };
+            Require(uniform(firstChannels) && (!alternateAlpha || uniform(secondChannels)), "different color attachment blend states require the independentBlend device feature");
+        }
         blend.attachmentCount = static_cast<std::uint32_t>(firstChannels.size());
         blend.pAttachments = firstChannels.empty() ? nullptr : firstChannels.data();
         std::copy(state.blendConstants.begin(), state.blendConstants.end(), blend.blendConstants);
@@ -733,7 +751,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             return;
         }
         const VkPipelineCache pipelineCache = state.stages.tessellation && !context.tessellationPipelineCache ? VK_NULL_HANDLE : context.pipelineCache;
-        if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
+        if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules, &libraryLeases);
         else {
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
             Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
@@ -774,28 +792,38 @@ Pipeline::~Pipeline() {
 }
 
 void Pipeline::release() noexcept {
-    framebuffers.clear();
     if (optimized != nullptr) optimized->Release();
     optimized.reset();
-    if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
-    if (backFaces) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, backFaces, nullptr);
-    if (secondChannel) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, secondChannel, nullptr);
-    if (renderPass) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, renderPass, nullptr);
-    if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
-    for (auto module : _modules) {
-        if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
-    }
-    pipeline = VK_NULL_HANDLE;
-    backFaces = VK_NULL_HANDLE;
-    secondChannel = VK_NULL_HANDLE;
-    renderPass = VK_NULL_HANDLE;
-    layout = VK_NULL_HANDLE;
-    _modules.clear();
+    WithPipelineLibraryDomain(libraryLeases, [&](bool alive) {
+        if (alive) {
+            framebuffers.clear();
+            if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+            if (backFaces) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, backFaces, nullptr);
+            if (secondChannel) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, secondChannel, nullptr);
+            if (renderPass) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, renderPass, nullptr);
+            if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+            for (auto module : _modules) {
+                if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            }
+        } else {
+            for (auto& entry : framebuffers) entry.framebuffer->Abandon();
+            framebuffers.clear();
+        }
+        pipeline = VK_NULL_HANDLE;
+        backFaces = VK_NULL_HANDLE;
+        secondChannel = VK_NULL_HANDLE;
+        renderPass = VK_NULL_HANDLE;
+        layout = VK_NULL_HANDLE;
+        _modules.clear();
+    });
+    libraryLeases.clear();
 }
 
 void Pipeline::Abandon() noexcept {
-    if (optimized != nullptr) optimized->released.store(true);
+    AbandonPipelineLibraryLeases(libraryLeases);
+    if (optimized != nullptr) optimized->AbandonLocal();
     optimized.reset();
+    libraryLeases.clear();
     for (auto& entry : framebuffers) entry.framebuffer->Abandon();
     framebuffers.clear();
     pipeline = VK_NULL_HANDLE;
@@ -1213,7 +1241,8 @@ void noteStoreReturn(PipelineStore& store, std::uint64_t hash) {
 
 void reportPipelines(PipelineStore& store) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return;
+    static const bool cacheStats = std::getenv("APS5_CACHE_STATS") != nullptr;
+    if (!profile && !cacheStats) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
@@ -1229,6 +1258,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 }
 
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool* created) {
+    CpuPhaseStats::ScopeTimer phaseTimer(CpuPhaseStats::Phase::PipelineStoreLookupBuild, true, true);
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (created != nullptr) *created = false;
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);

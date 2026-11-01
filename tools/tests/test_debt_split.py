@@ -1,4 +1,6 @@
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -199,7 +201,7 @@ class DebtSplitTests(unittest.TestCase):
             ["git", "-c", "user.name=Debt Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false",
              "-c", "maintenance.auto=false", *args],
             cwd=self.root, capture_output=True, text=True, check=check,
-            env={**os.environ, "GIT_EDITOR": "true"},
+            env={**os.environ, "GIT_EDITOR": shlex.quote(Path(shutil.which("true") or "true").as_posix())},
         )
 
     def write(self, path, text):

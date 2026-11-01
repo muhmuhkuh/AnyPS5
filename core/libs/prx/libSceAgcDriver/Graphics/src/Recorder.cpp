@@ -1,9 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CpuPhaseStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -384,6 +386,7 @@ std::size_t ReleaseQueueBound() {
 // waits for that count.
 void DestroyDeferred(std::vector<DeferredBatch> releasing, bool onThread) {
     if (releasing.empty()) return;
+    CpuPhaseStats::ScopeTimer deferredReleaseTimer(CpuPhaseStats::Phase::DeferredRelease, true, true);
     const bool profile = DrawProfiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto count = releasing.size();
@@ -2787,14 +2790,22 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
 }
 
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
+    return Upload(bytes, drawUpload, drawUploadUsed);
+}
+
+Recorder::UploadSlice Recorder::TextureUpload(std::size_t bytes) {
+    return Upload(bytes, textureUpload, textureUploadUsed);
+}
+
+Recorder::UploadSlice Recorder::Upload(std::size_t bytes, std::shared_ptr<Buffer>& buffer, VkDeviceSize& used) {
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
-    auto offset = (drawUploadUsed + alignment - 1) & ~(alignment - 1);
-    if (drawUpload == nullptr || offset + bytes > drawUpload->Bytes().size()) {
-        drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    auto offset = (used + alignment - 1) & ~(alignment - 1);
+    if (buffer == nullptr || offset + bytes > buffer->Bytes().size()) {
+        buffer = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         offset = 0;
     }
-    drawUploadUsed = offset + bytes;
-    return {drawUpload, offset, drawUpload->Bytes().data() + offset};
+    used = offset + bytes;
+    return {buffer, offset, buffer->Bytes().data() + offset};
 }
 
 void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
@@ -3695,6 +3706,16 @@ void Recorder::Submit() {
     const auto submitStart = std::chrono::steady_clock::now();
     const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
     if (result == VK_ERROR_DEVICE_LOST) {
+        std::fprintf(stderr, "[gpu] vkQueueSubmit recorder returned %d before device-idle error cleanup\n", static_cast<int>(result));
+        std::fflush(stderr);
+        try {
+            ReportDeviceLost();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[gpu] device-loss diagnostics failed: %s\n", error.what());
+        } catch (...) {
+            std::fprintf(stderr, "[gpu] device-loss diagnostics failed with an unknown exception\n");
+        }
+        std::fflush(stderr);
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
     }
@@ -3833,11 +3854,16 @@ void Recorder::Sync() {
         finish(std::move(batch), true, source);
     }
     activeSyncSite = previousSite;
+    if (GuestMemory::GpuMutex().HeldByThisThread() && activeRecorder == this && open == nullptr && inFlight.empty() && finishing.empty()) ReclaimIdleRetiredDepthSurfaces(context.device);
 }
 
 void Recorder::FlushDeferredReleases() {
     holdKept.clear();
     ReleaseDeferredKeeps();
+}
+
+bool Recorder::DeferredReleasesPending() {
+    return deferredPending.load(std::memory_order_acquire) != 0;
 }
 
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
@@ -4177,13 +4203,19 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
         const auto waitFences = function(waitForFences, "vkWaitForFences");
-        auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+        const auto timedWait = [&] {
+            CpuPhaseStats::ScopeTimer fenceWaitTimer(CpuPhaseStats::Phase::FenceWait);
+            return waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+        };
+        auto result = timedWait();
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
-            result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+            result = timedWait();
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
+            std::fprintf(stderr, "[gpu] vkWaitForFences recorder returned %d before device-idle error cleanup\n", static_cast<int>(result));
+            std::fflush(stderr);
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
@@ -4214,6 +4246,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     const bool profile = DrawProfiled();
     const auto completionStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     {
+        CpuPhaseStats::ScopeTimer completionTimer(CpuPhaseStats::Phase::BatchCompletions);
         struct InCompletion {
             InCompletion() { ++completionDepth; }
             ~InCompletion() { --completionDepth; }
@@ -4241,22 +4274,25 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     const auto keptStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Deferred only from inside a hold: the unlock that releases the list is this thread's own, and
     // a caller finishing batches without the mutex (a test) might never make one.
-    if (releaseNow || ReleaseUnderLock() || !GuestMemory::GpuMutex().HeldByThisThread()) {
-        batch->completions.clear();
-        batch->kept.clear();
-    } else {
-        // To this thread's unlock (see ReleaseDeferredKeeps); the completions go with the objects,
-        // their captures hold the same ones. The push comes first: a failed one (the list's growth)
-        // destroys the batch's objects here, under the mutex, counts nothing the destructor would
-        // wait for and must not escape (the rest of finish() releases the fence and command buffer).
-        try {
-            DeferredBatches().push_back({std::move(batch->kept), std::move(batch->completions)});
-            deferredPending.fetch_add(1, std::memory_order_acq_rel);
-            DeferredBytes() += batch->keptBytes;
-        } catch (...) {
+    {
+        CpuPhaseStats::ScopeTimer keptRetirementTimer(CpuPhaseStats::Phase::KeptRetirement);
+        if (releaseNow || ReleaseUnderLock() || !GuestMemory::GpuMutex().HeldByThisThread()) {
+            batch->completions.clear();
+            batch->kept.clear();
+        } else {
+            // To this thread's unlock (see ReleaseDeferredKeeps); the completions go with the objects,
+            // their captures hold the same ones. The push comes first: a failed one (the list's growth)
+            // destroys the batch's objects here, under the mutex, counts nothing the destructor would
+            // wait for and must not escape (the rest of finish() releases the fence and command buffer).
+            try {
+                DeferredBatches().push_back({std::move(batch->kept), std::move(batch->completions)});
+                deferredPending.fetch_add(1, std::memory_order_acq_rel);
+                DeferredBytes() += batch->keptBytes;
+            } catch (...) {
+            }
+            batch->completions.clear();
+            batch->kept.clear();
         }
-        batch->completions.clear();
-        batch->kept.clear();
     }
     if (profile) {
         const auto now = std::chrono::steady_clock::now();
@@ -4297,6 +4333,7 @@ void Recorder::removeLabels(Batch& batch) {
 }
 
 void Recorder::release(Batch& batch) noexcept {
+    CpuPhaseStats::ScopeTimer batchReleaseTimer(CpuPhaseStats::Phase::BatchRelease, true, true);
     if (batch.queries != VK_NULL_HANDLE) {
         if (!GpuTimingEnabled() && sparePools.size() < 64) {
             try {

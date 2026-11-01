@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "CacheKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CpuPhaseStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "CompiledVariant.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
@@ -64,7 +65,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnosti
     } catch (...) {
         failure = std::current_exception();
         try {
-            if (std::getenv("APS5_DUMP_SHADERS") != nullptr) dump = Driver::dumpRequest(request.shader.codeAddress, request, ".prepare");
+            if (std::getenv("APS5_DUMP_SHADERS") != nullptr || std::getenv("APS5_DUMP_FAILED_SHADERS") != nullptr) dump = Driver::dumpRequest(request.shader.codeAddress, request, ".prepare");
         } catch (...) {}
     }
     try {
@@ -713,6 +714,7 @@ ShaderRegistry::Chunk& ShaderRegistry::writable(std::size_t index) {
 }
 
 ShaderRegistry::const_iterator ShaderRegistry::find(std::uint64_t address) const {
+    AgcDriver::CpuPhaseStats::ScopeTimer phaseTimer(AgcDriver::CpuPhaseStats::Phase::ShaderRegistryLookup, true, true);
     if (chunks.empty()) return end();
     const auto index = chunkFor(address);
     const auto found = chunks[index]->find(address);

@@ -8,8 +8,11 @@
 #include <vulkan/vulkan.h>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -17,6 +20,7 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -69,8 +73,96 @@ inline void ReportDeviceLost() {
 }
 
 inline void Check(VkResult result, const char* operation) {
-    if (result == VK_ERROR_DEVICE_LOST) ReportDeviceLost();
+    if (result == VK_ERROR_DEVICE_LOST) {
+        std::fprintf(stderr, "[gpu] %s returned VK_ERROR_DEVICE_LOST\n", operation);
+        std::fflush(stderr);
+        ReportDeviceLost();
+    }
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
+}
+
+inline std::filesystem::path ShaderModuleDumpDirectory() {
+#ifdef _WIN32
+    const wchar_t* value = _wgetenv(L"APS5_SHADER_MODULE_DUMP_DIR");
+    return value != nullptr && *value != L'\0' ? std::filesystem::path(value) : std::filesystem::path{};
+#else
+    const char* value = std::getenv("APS5_SHADER_MODULE_DUMP_DIR");
+    return value != nullptr && *value != '\0' ? std::filesystem::path(value) : std::filesystem::path{};
+#endif
+}
+
+template<typename THandle>
+inline std::uint64_t ShaderModuleHandleBits(THandle handle) {
+    if constexpr (std::is_pointer_v<THandle>) return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(handle));
+    else return static_cast<std::uint64_t>(handle);
+}
+
+inline bool WriteShaderModuleFileExclusive(const std::filesystem::path& path, const void* data, std::size_t bytes, bool& created) {
+    created = false;
+    std::FILE* file = nullptr;
+#ifdef _WIN32
+    if (_wfopen_s(&file, path.c_str(), L"wbx") != 0) file = nullptr;
+#else
+    file = std::fopen(path.c_str(), "wbx");
+#endif
+    if (file == nullptr) return false;
+    created = true;
+    const bool wrote = std::fwrite(data, 1, bytes, file) == bytes;
+    const bool closed = std::fclose(file) == 0;
+    return wrote && closed;
+}
+
+inline void DumpCreatedShaderModule(VkDevice device, VkShaderModule module, const VkShaderModuleCreateInfo& info) noexcept {
+    try {
+        const auto directory = ShaderModuleDumpDirectory();
+        if (directory.empty()) return;
+        static std::atomic<std::uint64_t> nextSerial{0};
+        const auto serial = nextSerial.fetch_add(1, std::memory_order_relaxed) + 1;
+        constexpr std::uint64_t MaxShaderModuleDumps = 512;
+        if (serial > MaxShaderModuleDumps) {
+            if (serial == MaxShaderModuleDumps + 1) std::fprintf(stderr, "[shader-module-dump] capture cap (%llu) reached\n", static_cast<unsigned long long>(MaxShaderModuleDumps));
+            return;
+        }
+        if (module == VK_NULL_HANDLE || info.pCode == nullptr || info.codeSize == 0 || info.codeSize % sizeof(std::uint32_t) != 0) {
+            std::fprintf(stderr, "[shader-module-dump] invalid successful module capture input; serial=%llu\n", static_cast<unsigned long long>(serial));
+            return;
+        }
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        if (error) {
+            std::fprintf(stderr, "[shader-module-dump] cannot create output directory; serial=%llu error=%s\n", static_cast<unsigned long long>(serial), error.message().c_str());
+            return;
+        }
+        const auto moduleBits = ShaderModuleHandleBits(module);
+        const auto deviceBits = ShaderModuleHandleBits(device);
+        char stem[96];
+        std::snprintf(stem, sizeof(stem), "shader-module-%08llu-h%016llx", static_cast<unsigned long long>(serial), static_cast<unsigned long long>(moduleBits));
+        const auto spirvPath = directory / (std::string(stem) + ".spv");
+        const auto metadataPath = directory / (std::string(stem) + ".json");
+        bool spirvCreated = false;
+        if (!WriteShaderModuleFileExclusive(spirvPath, info.pCode, info.codeSize, spirvCreated)) {
+            if (spirvCreated) { std::filesystem::remove(spirvPath, error); }
+            std::fprintf(stderr, "[shader-module-dump] SPIR-V write failed; serial=%llu handle=0x%016llx errno=%d\n", static_cast<unsigned long long>(serial), static_cast<unsigned long long>(moduleBits), errno);
+            return;
+        }
+        char metadata[512];
+        const int metadataBytes = std::snprintf(metadata, sizeof(metadata),
+            "{\"schema\":1,\"serial\":%llu,\"device\":\"0x%016llx\",\"vk_shader_module\":\"0x%016llx\",\"code_size_bytes\":%llu,\"pcode_word_count\":%llu,\"capture_point\":\"exact VkShaderModuleCreateInfo.pCode after vkCreateShaderModule success\",\"spirv_file\":\"%s.spv\"}\n",
+            static_cast<unsigned long long>(serial), static_cast<unsigned long long>(deviceBits), static_cast<unsigned long long>(moduleBits),
+            static_cast<unsigned long long>(info.codeSize), static_cast<unsigned long long>(info.codeSize / sizeof(std::uint32_t)), stem);
+        bool metadataCreated = false;
+        if (metadataBytes <= 0 || static_cast<std::size_t>(metadataBytes) >= sizeof(metadata) ||
+            !WriteShaderModuleFileExclusive(metadataPath, metadata, static_cast<std::size_t>(metadataBytes), metadataCreated)) {
+            if (metadataCreated) { std::filesystem::remove(metadataPath, error); }
+            std::filesystem::remove(spirvPath, error);
+            std::fprintf(stderr, "[shader-module-dump] metadata write failed; serial=%llu handle=0x%016llx errno=%d\n", static_cast<unsigned long long>(serial), static_cast<unsigned long long>(moduleBits), errno);
+            return;
+        }
+        std::fprintf(stderr, "[shader-module-dump] serial=%llu handle=0x%016llx words=%llu file=%s.spv\n", static_cast<unsigned long long>(serial), static_cast<unsigned long long>(moduleBits), static_cast<unsigned long long>(info.codeSize / sizeof(std::uint32_t)), stem);
+    } catch (...) {
+        std::fprintf(stderr, "[shader-module-dump] unexpected diagnostic exception; Vulkan module creation remains successful\n");
+    }
+
 }
 
 inline VkShaderModule CreateShaderModule(PFN_vkCreateShaderModule create, VkDevice device, bool graphicsPipelineLibrary, const std::uint32_t* code, std::size_t bytes, const char* operation) {
@@ -81,6 +173,7 @@ inline VkShaderModule CreateShaderModule(PFN_vkCreateShaderModule create, VkDevi
     info.pCode = keyed.data();
     VkShaderModule module = VK_NULL_HANDLE;
     Check(create(device, &info, nullptr, &module), operation);
+    DumpCreatedShaderModule(device, module, info);
     return module;
 }
 
@@ -194,7 +287,7 @@ struct Context {
     std::uint32_t settleFamily = 0;
     std::mutex* settleQueueMutex = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
-    VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes, bool newImage) = nullptr;
+    VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes, bool newImage, VkDevice device) = nullptr;
     RenderCache* renderCache = nullptr;
     DrawQueue* drawQueue = nullptr;
     GraphicsPipelineCache* graphicsPipelines = nullptr;
@@ -265,6 +358,7 @@ struct Context {
     bool pipelineExecutableInfo = false;
     bool maintenance8 = false;
     bool graphicsPipelineLibrary = false;
+    bool independentBlend = false;
     bool pipelineLinkTimeOptimization = true;
     std::uint32_t srgbDecodeFormats = 0;
     std::uint32_t srgbCopyFormats = 0;

@@ -82,7 +82,7 @@ std::vector<std::uint32_t> UserData(const std::string& text) {
     return {replay.request.context.userData.begin(), replay.request.context.userData.end()};
 }
 
-void Run() {
+void Run(bool failureOnly) {
     char prefix[64];
     std::snprintf(prefix, sizeof(prefix), "shader_%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(Code.data())));
     const std::string first = std::string(prefix) + ".req";
@@ -94,6 +94,7 @@ void Run() {
     Dispatch(valid);
     AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output.data()), sizeof(Output));
     for (const auto word : Output) Require(word == 0u, "the dispatch through the valid descriptor stored nothing");
+    if (failureOnly) Require(!std::filesystem::exists(first), "a successful dispatch was dumped in failure-only mode");
     const auto unsupported = Pointer(Unsupported.data());
     std::string message;
     try {
@@ -103,18 +104,27 @@ void Run() {
     }
     Require(message.find("unsupported type") != std::string::npos, "the dispatch through a type 2 descriptor failed for another reason: " + message);
     Require(message.find("(" + failed + ")") != std::string::npos, "the failure does not name the failing dispatch's request: " + message);
-    const auto firstText = Read(first);
     const auto failedText = Read(failed);
-    Require(UserData(firstText) == std::vector<std::uint32_t>(valid.begin(), valid.end()), "the first dispatch's request lost its user data");
+    if (failureOnly) {
+        Require(!std::filesystem::exists(first), "failure-only mode created a request for the successful dispatch");
+    } else {
+        const auto firstText = Read(first);
+        Require(UserData(firstText) == std::vector<std::uint32_t>(valid.begin(), valid.end()), "the first dispatch's request lost its user data");
+        Require(Replay(firstText).empty(), "the first dispatch's request does not replay: " + Replay(firstText));
+    }
     Require(UserData(failedText) == std::vector<std::uint32_t>(unsupported.begin(), unsupported.end()), "the failed request holds another dispatch's user data");
-    Require(Replay(firstText).empty(), "the first dispatch's request does not replay: " + Replay(firstText));
     const auto replayed = Replay(failedText);
     Require(replayed.find("unsupported type") != std::string::npos, "the failed request does not replay its failure: " + replayed);
 }
 
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const bool failureOnly = argc == 2 && std::string(argv[1]) == "--failure-only";
+    if (argc > 2 || (argc == 2 && !failureOnly)) {
+        std::cerr << "usage: agc_driver_failed_capture_dump_tests [--failure-only]\n";
+        return 2;
+    }
     const auto directory = std::filesystem::temp_directory_path() / ("agc_failed_capture_dump-" + std::to_string(std::random_device{}()));
     try {
         {
@@ -125,15 +135,17 @@ int main() {
         std::filesystem::create_directories(directory);
         std::filesystem::current_path(directory);
 #ifdef _WIN32
-        Require(_putenv_s("APS5_DUMP_SHADERS", "1") == 0, "cannot enable shader capture");
+        Require(_putenv_s("APS5_DUMP_SHADERS", failureOnly ? "" : "1") == 0, "cannot configure shader capture");
+        Require(_putenv_s("APS5_DUMP_FAILED_SHADERS", failureOnly ? "1" : "") == 0, "cannot configure failure-only shader capture");
 #else
-        Require(setenv("APS5_DUMP_SHADERS", "1", 1) == 0, "cannot enable shader capture");
+        Require(failureOnly ? unsetenv("APS5_DUMP_SHADERS") == 0 : setenv("APS5_DUMP_SHADERS", "1", 1) == 0, "cannot configure shader capture");
+        Require(failureOnly ? setenv("APS5_DUMP_FAILED_SHADERS", "1", 1) == 0 : unsetenv("APS5_DUMP_FAILED_SHADERS") == 0, "cannot configure failure-only shader capture");
 #endif
-        Run();
+        Run(failureOnly);
         try { AgcDriverShutdown_nid_postfix(); } catch (const std::exception&) {}
         std::filesystem::current_path(directory.parent_path());
         std::filesystem::remove_all(directory);
-        std::puts("failed capture dump tests passed");
+        std::puts(failureOnly ? "failure-only capture dump tests passed" : "failed capture dump tests passed");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

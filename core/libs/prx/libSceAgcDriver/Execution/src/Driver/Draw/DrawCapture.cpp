@@ -88,8 +88,9 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     stageCapture.pushOffset = pushOffset;
     const auto named = [&](const std::exception& error, std::span<const ShaderRecompiler::MemoryRegion> regions) {
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
+        static const bool dumpFailedShaders = std::getenv("APS5_DUMP_FAILED_SHADERS") != nullptr;
         std::string dump;
-        if (dumpShaders) {
+        if (dumpShaders || dumpFailedShaders) {
             try {
                 auto failed = request;
                 failed.context.memory = regions;

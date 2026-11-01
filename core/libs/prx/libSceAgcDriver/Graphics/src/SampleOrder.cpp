@@ -285,6 +285,7 @@ private:
         info.pCode = code;
         VkShaderModule created = VK_NULL_HANDLE;
         Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &info, nullptr, &created), "vkCreateShaderModule sample order");
+        DumpCreatedShaderModule(context.device, created, info);
         return created;
     }
 

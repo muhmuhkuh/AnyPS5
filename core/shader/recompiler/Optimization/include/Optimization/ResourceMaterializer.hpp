@@ -22,12 +22,16 @@ struct ImageTableElement {
     std::uint32_t samplers = 0;
     bool atomic = false;
     bool atomic64 = false;
+
+    bool operator==(const ImageTableElement&) const = default;
 };
 
 struct ImageTableSamplerElement {
     std::array<std::uint32_t, 4> words{};
     bool compare = false;
     bool point = false;
+
+    bool operator==(const ImageTableSamplerElement&) const = default;
 };
 
 struct ImageTablePoisonRecord {
@@ -35,6 +39,8 @@ struct ImageTablePoisonRecord {
     std::uint32_t dwordCount = 0;
     std::uint32_t resource = 0;
     ImageTableAbi::PoisonReason reason = ImageTableAbi::PoisonReason::OutsideSnapshot;
+
+    bool operator==(const ImageTablePoisonRecord&) const = default;
 };
 
 struct ResolvedImageTables {
@@ -53,6 +59,11 @@ struct ImageTableReuseCounts {
     std::uint64_t columns = 0;
     std::uint64_t resolutions = 0;
     std::uint64_t resolutionsShared = 0;
+    std::uint64_t columnHits = 0;
+    std::uint64_t columnMisses = 0;
+    std::uint64_t columnEvictions = 0;
+    std::uint64_t columnVerified = 0;
+    std::uint64_t columnMismatches = 0;
 };
 
 struct RuntimeImageModeMatch {
@@ -72,6 +83,7 @@ public:
     void ApplyStaticInterface(IrProgram& program, bool nativeSampleOffsets = true) const;
     static std::vector<ImageResource> RuntimeImageModes(const ImageResource& image);
     static RuntimeImageModeMatch TryRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes);
+    static RuntimeImageModeMatch TryRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes, bool includeDetail);
     static std::uint32_t RuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes);
     static void PrepareImageModes(ShaderInfo& info);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);

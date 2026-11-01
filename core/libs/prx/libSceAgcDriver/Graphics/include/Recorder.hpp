@@ -97,6 +97,7 @@ public:
     void KeepBytes(const void* owner, std::size_t bytes);
     std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
     void FlushDeferredReleases();
+    static bool DeferredReleasesPending();
     static constexpr std::size_t KeptBytesBudget = std::size_t{512} << 20u;
     void BoundKeptBytes();
     std::size_t InFlightKeptBytes() const { return inFlightKeptBytes; }
@@ -118,6 +119,7 @@ public:
         std::byte* bytes = nullptr;
     };
     UploadSlice DrawUpload(std::size_t bytes);
+    UploadSlice TextureUpload(std::size_t bytes);
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
@@ -557,6 +559,7 @@ public:
     static bool FlipReadCheck();
 
 private:
+    UploadSlice Upload(std::size_t bytes, std::shared_ptr<Buffer>& buffer, VkDeviceSize& used);
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
@@ -858,6 +861,8 @@ private:
     std::uint64_t writeNoteCount = 0;
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
+    std::shared_ptr<Buffer> textureUpload;
+    VkDeviceSize textureUploadUsed = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
     // frame would otherwise allocate and free their objects each time).
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;

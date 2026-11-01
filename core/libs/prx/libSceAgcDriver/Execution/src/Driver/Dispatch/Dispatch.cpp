@@ -15,8 +15,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -59,14 +61,32 @@ void ReportDispatchItems(bool profile) {
 }
 
 bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code) {
+    constexpr std::size_t CompareChunkBytes = 64u << 10u;
+    std::array<std::byte, CompareChunkBytes> current{};
+    const auto addressMax = std::numeric_limits<std::uint64_t>::max();
+    if (code.code.size() > addressMax / sizeof(std::uint32_t)) return false;
+    const auto codeBytes = static_cast<std::uint64_t>(code.code.size()) * sizeof(std::uint32_t);
+    if (code.codeAddress > addressMax - codeBytes) return false;
+    const auto headerBytes = static_cast<std::uint64_t>(code.header.size());
+    if (!code.header.empty() && code.headerAddress > addressMax - headerBytes) return false;
     for (const auto& region : captured) {
         const auto address = region.guestAddress;
         const auto bytes = region.bytes.size();
-        if (bytes == 0 || (address >= code.codeAddress && address < code.codeAddress + code.code.size() * sizeof(std::uint32_t)) || (!code.header.empty() && address >= code.headerAddress && address < code.headerAddress + code.header.size())) continue;
+        if (bytes == 0) continue;
+        const auto rangeBytes = static_cast<std::uint64_t>(bytes);
+        if (rangeBytes > addressMax - address) return false;
+        if ((address >= code.codeAddress && address - code.codeAddress < codeBytes) ||
+            (!code.header.empty() && address >= code.headerAddress && address - code.headerAddress < headerBytes)) continue;
         if (Driver::QueryPendingSpan(address, bytes, {}) != ShaderMemory::PendingWrite::None || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return false;
         GuestMemory::GuardRead(address, bytes);
         GuestMemory::FlushGpuWrites(address, bytes);
-        if (std::memcmp(region.bytes.data(), reinterpret_cast<const void*>(address), bytes) != 0) return false;
+        for (std::size_t offset = 0; offset < bytes;) {
+            const auto count = std::min(current.size(), bytes - offset);
+            const auto output = std::span(current).first(count);
+            if (GuestMemory::CopyMapped(address + static_cast<std::uint64_t>(offset), output) != GuestMemory::Compare::Equal ||
+                std::memcmp(output.data(), region.bytes.data() + offset, count) != 0) return false;
+            offset += count;
+        }
     }
     return true;
 }
@@ -368,6 +388,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         std::uint64_t forgetAtCapture = 0;
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
+        static const bool dumpFailedShaders = std::getenv("APS5_DUMP_FAILED_SHADERS") != nullptr;
         try {
             auto invocation = InvocationFor(snapshot, codeOffset, request);
             timing.Mark("prepared_invocation");
@@ -397,7 +418,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (profile && elapsed > 200) std::fprintf(stderr, "[gpu] compute shader 0x%llx recompile took %.0f ms (%zu SPIR-V words, %zu captured regions, total %.1f s)\n", static_cast<unsigned long long>(address), elapsed, compiledResult->spirv.size(), captured.size(), totalMs / 1000);
         } catch (const std::exception& error) {
             std::string dump;
-            if (dumpShaders) {
+            if (dumpShaders || dumpFailedShaders) {
                 const auto regions = shaderMemory->Regions();
                 auto failed = request;
                 failed.context.memory = regions;

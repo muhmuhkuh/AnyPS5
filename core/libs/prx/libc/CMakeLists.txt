@@ -10,6 +10,26 @@ if(BUILD_TESTING)
             add_test(NAME windows_mappings_release_mismatch_${mode} COMMAND windows_mappings_release_tests ${mode})
             set_tests_properties(windows_mappings_release_mismatch_${mode} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endforeach()
+        add_test_executable(windows_direct_memory_file_backing_tests ${LIBS_INCLUDE_DIR}/tests/WindowsDirectMemoryFileBacking.cpp)
+        target_include_directories(windows_direct_memory_file_backing_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(windows_direct_memory_file_backing_tests PRIVATE libc)
+        configure_windows_unwind(windows_direct_memory_file_backing_tests)
+        add_test(NAME windows_direct_memory_file_backing_pagefile_control COMMAND windows_direct_memory_file_backing_tests --pagefile-control)
+        add_test(NAME windows_direct_memory_file_backing COMMAND windows_direct_memory_file_backing_tests --file-backed)
+        set_tests_properties(windows_direct_memory_file_backing_pagefile_control windows_direct_memory_file_backing PROPERTIES TIMEOUT 30
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        add_test_executable(windows_direct_memory_shared_primary_tests ${LIBS_INCLUDE_DIR}/tests/WindowsDirectMemorySharedPrimary.cpp)
+        target_include_directories(windows_direct_memory_shared_primary_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(windows_direct_memory_shared_primary_tests PRIVATE libc)
+        configure_windows_unwind(windows_direct_memory_shared_primary_tests)
+        add_test(NAME windows_direct_memory_shared_primary_default_control COMMAND windows_direct_memory_shared_primary_tests --default-control)
+        set_tests_properties(windows_direct_memory_shared_primary_default_control PROPERTIES TIMEOUT 30
+            ENVIRONMENT "APS5_DIRECT_MEMORY_SHARED=0"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        add_test(NAME windows_direct_memory_shared_primary_opt_in COMMAND windows_direct_memory_shared_primary_tests --shared-primary)
+        set_tests_properties(windows_direct_memory_shared_primary_opt_in PROPERTIES TIMEOUT 30
+            ENVIRONMENT "APS5_DIRECT_MEMORY_SHARED=1"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
     add_test_executable(guest_binary_word_tests ${LIBS_INCLUDE_DIR}/tests/GuestBinaryWord.cpp)

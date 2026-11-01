@@ -15,6 +15,7 @@ VkPipeline TextureDetiler::multisampleUploadPipeline(std::uint32_t elementBytes)
         info.codeSize = sizeof(MULTISAMPLE_UPLOAD_SPV);
         info.pCode = MULTISAMPLE_UPLOAD_SPV;
         Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &info, nullptr, &multisampleUploadModule), "vkCreateShaderModule multisample upload");
+        DumpCreatedShaderModule(context.device, multisampleUploadModule, info);
     }
     const VkSpecializationMapEntry entry{0u, 0u, sizeof(elementBytes)};
     const VkSpecializationInfo specialization{1u, &entry, sizeof(elementBytes), &elementBytes};

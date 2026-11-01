@@ -46,6 +46,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstdio>
+#include <exception>
 #include <chrono>
 #include <algorithm>
 #include <numeric>
@@ -398,10 +399,61 @@ void releaseSettleBatches(VkDevice device, ImportSettle& settle) {
 }
 #endif
 
+#ifdef _WIN32
+void flushRetiredHostAlias(const HostImport& entry) {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_DIRECT_MEMORY_FILE");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled || entry.alias == nullptr || entry.bytes == 0) return;
+    const auto fail = [&](const char* reason, DWORD error, std::uintptr_t address = 0, DWORD state = 0, DWORD type = 0, std::uintptr_t allocationBase = 0) {
+        std::fprintf(stderr, "[gpu] FlushViewOfFile for retired host import alias %p+0x%llx failed: %s (Win32=%lu, address=0x%llx, state=0x%lx, type=0x%lx, allocationBase=0x%llx); refusing to unmap guest memory while direct-memory file backing is enabled\n",
+            entry.alias, static_cast<unsigned long long>(entry.bytes), reason, static_cast<unsigned long>(error),
+            static_cast<unsigned long long>(address), static_cast<unsigned long>(state), static_cast<unsigned long>(type),
+            static_cast<unsigned long long>(allocationBase));
+        std::fflush(stderr);
+        std::terminate();
+    };
+
+    const auto start = reinterpret_cast<std::uintptr_t>(entry.alias);
+    if (entry.bytes > static_cast<std::uint64_t>(std::numeric_limits<std::uintptr_t>::max() - start) ||
+        entry.bytes > static_cast<std::uint64_t>(std::numeric_limits<SIZE_T>::max())) {
+        fail("alias range overflows the host address/size type", ERROR_ARITHMETIC_OVERFLOW, start);
+    }
+    const auto end = start + static_cast<std::uintptr_t>(entry.bytes);
+    auto cursor = start;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) {
+            fail("VirtualQuery failed", GetLastError(), cursor);
+        }
+        const auto regionBase = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+        if (info.RegionSize == 0 || info.RegionSize > std::numeric_limits<std::uintptr_t>::max() - regionBase) {
+            fail("VirtualQuery returned an invalid region range", ERROR_INVALID_DATA, cursor, info.State, info.Type);
+        }
+        const auto regionEnd = regionBase + info.RegionSize;
+        if (cursor < regionBase || cursor >= regionEnd) {
+            fail("VirtualQuery region does not contain the queried address", ERROR_INVALID_DATA, cursor, info.State, info.Type, reinterpret_cast<std::uintptr_t>(info.AllocationBase));
+        }
+        const auto allocationBase = reinterpret_cast<std::uintptr_t>(info.AllocationBase);
+        if (allocationBase == 0 || info.State != MEM_COMMIT || info.Type != MEM_MAPPED || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+            fail("alias range is not committed readable mapped memory", ERROR_INVALID_ADDRESS, cursor, info.State, info.Type, allocationBase);
+        }
+        const auto chunkEnd = std::min(end, regionEnd);
+        const auto chunkBytes = static_cast<SIZE_T>(chunkEnd - cursor);
+        if (chunkBytes == 0 || !FlushViewOfFile(reinterpret_cast<const void*>(cursor), chunkBytes)) {
+            fail("FlushViewOfFile failed", chunkBytes == 0 ? ERROR_INVALID_DATA : GetLastError(), cursor, info.State, info.Type, allocationBase);
+        }
+        cursor = chunkEnd;
+    }
+}
+#endif
+
 void destroyImport(const Context& context, const HostImport& entry) {
     context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
     context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
 #ifdef _WIN32
+    flushRetiredHostAlias(entry);
     GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
 }
@@ -420,6 +472,7 @@ struct RetiredImport {
         destroyBuffer(device, entry.buffer, nullptr);
         freeMemory(device, entry.memory, nullptr);
 #ifdef _WIN32
+        flushRetiredHostAlias(entry);
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
     }

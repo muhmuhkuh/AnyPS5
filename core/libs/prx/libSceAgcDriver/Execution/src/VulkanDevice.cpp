@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CpuPhaseStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -45,6 +46,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -421,6 +423,7 @@ struct VulkanDevice::State {
     bool primitiveListRestart = false;
     bool depthClipControl = false;
     bool graphicsPipelineLibrary = false;
+    bool independentBlend = false;
     bool pipelineLinkTimeOptimization = true;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
@@ -550,6 +553,12 @@ struct VulkanDevice::State {
         std::shared_ptr<void> kept;
         std::shared_ptr<void> keptPlane;
         std::unique_ptr<Graphics::Buffer> dumpBuffer;
+        std::unique_ptr<Graphics::Buffer> sourceBuffer;
+        bool sourceRecorded = false;
+        std::uint32_t sourceWidth = 0, sourceHeight = 0, sourceLayer = 0;
+        VkFormat sourceFormat = VK_FORMAT_UNDEFINED;
+        std::uint64_t sourceImage = 0, sourceGeneration = 0;
+        const void* sourceObject = nullptr;
         std::unique_ptr<PresentationScaler> dumpScaler;
         std::uint32_t dumpWidth = 0;
         std::uint32_t dumpHeight = 0;
@@ -749,6 +758,29 @@ struct VulkanDevice::State {
     // and its statistics taken (under presentMutex).
     void RetireSlot(PresentSlot& slot) {
         slot.inFlight = false;
+        if (slot.sourceRecorded) {
+            slot.sourceRecorded = false;
+            try {
+                const auto status = DeviceFunction<PFN_vkGetFenceStatus>("vkGetFenceStatus")(device, slot.fence);
+                if (status == VK_SUCCESS) {
+                    slot.sourceBuffer->Invalidate();
+                    const auto bytes = slot.sourceBuffer->Bytes();
+                    std::uint64_t nonzero = 0;
+                    const auto sourceBytes = static_cast<std::size_t>(slot.sourceWidth) * slot.sourceHeight * 4;
+                    require(bytes.size() >= sourceBytes, "source readback buffer is too small");
+                    for (std::size_t i = 0; i < sourceBytes; i += 4) {
+                        if (bytes[i] != std::byte{} || bytes[i + 1] != std::byte{} || bytes[i + 2] != std::byte{}) ++nonzero;
+                    }
+                    CaptureTrace::LogBestEffort("present-source dump=%d vk_image=%llx storage_object=%p device=%p generation=%llu vk_format=%d width=%u height=%u layer=%u rgb_nonzero=%llu pixels=%llu", slot.dumpIndex, static_cast<unsigned long long>(slot.sourceImage), slot.sourceObject, static_cast<void*>(device), static_cast<unsigned long long>(slot.sourceGeneration), static_cast<int>(slot.sourceFormat), slot.sourceWidth, slot.sourceHeight, slot.sourceLayer, static_cast<unsigned long long>(nonzero), static_cast<unsigned long long>(static_cast<std::uint64_t>(slot.sourceWidth) * slot.sourceHeight));
+                } else CaptureTrace::LogBestEffort("present-source-discard dump=%d fence_status=%d", slot.dumpIndex, static_cast<int>(status));
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[gpu] source readback discarded: %s\n", error.what());
+                CaptureTrace::LogBestEffort("present-source-discard dump=%d error=readback", slot.dumpIndex);
+            } catch (...) {
+                std::fprintf(stderr, "[gpu] source readback discarded: unknown error\n");
+                CaptureTrace::LogBestEffort("present-source-discard dump=%d error=unknown", slot.dumpIndex);
+            }
+        }
         if (presentation) presentation->Release(static_cast<std::size_t>(&slot - presentSlots.data()));
         if (planePass) planePass->Release(static_cast<std::size_t>(&slot - presentSlots.data()));
         slot.kept.reset();
@@ -838,7 +870,13 @@ struct VulkanDevice::State {
     void WaitPresentFence(VkFence fence) {
         static const bool poll = std::getenv("APS5_PRESENT_POLL_FENCE") != nullptr;
         if (!poll) {
-            check(DeviceFunction<PFN_vkWaitForFences>("vkWaitForFences")(device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences present");
+            const auto waitForFences = DeviceFunction<PFN_vkWaitForFences>("vkWaitForFences");
+            VkResult result;
+            {
+                CpuPhaseStats::ScopeTimer presentFenceWaitTimer(CpuPhaseStats::Phase::PresentFenceWait, true, true);
+                result = waitForFences(device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+            }
+            check(result, "vkWaitForFences present");
             return;
         }
         const auto status = DeviceFunction<PFN_vkGetFenceStatus>("vkGetFenceStatus");
@@ -864,6 +902,8 @@ struct VulkanDevice::State {
             Graphics::DeviceLostOwner() = nullptr;
         }
         if (compileOnly && device != VK_NULL_HANDLE) {
+            Graphics::ClearCachedPipelines(device);
+            Graphics::AbandonPipelineLibraries(device);
             reinterpret_cast<PFN_vkDestroyDevice>(deviceProc(device, "vkDestroyDevice"))(device, nullptr);
             device = VK_NULL_HANDLE;
         }
@@ -880,6 +920,7 @@ struct VulkanDevice::State {
             }
             for (auto& slot : presentSlots) {
                 slot.dumpBuffer.reset();
+                slot.sourceBuffer.reset();
                 slot.dumpScaler.reset();
             }
             // Results still in the unit shadows reach guest memory before the device goes; the
@@ -959,6 +1000,7 @@ struct VulkanDevice::State {
             }
             if (settlePool != VK_NULL_HANDLE) destroyPool(device, settlePool, nullptr);
             Graphics::DestroyDeferredObjects(device);
+            Graphics::AbandonPipelineLibraries(device);
             destroyDevice(device, nullptr);
         }
         if (instance != VK_NULL_HANDLE) {
@@ -1733,6 +1775,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     require(available.vertexPipelineStoresAndAtomics && available.fragmentStoresAndAtomics, "graphics shader buffer writes and atomics are unavailable");
     VkPhysicalDeviceFeatures enabled{};
     enabled.shaderInt64 = VK_TRUE;
+    enabled.independentBlend = available.independentBlend;
+    state->independentBlend = enabled.independentBlend == VK_TRUE;
     enabled.shaderFloat64 = available.shaderFloat64 && floatControls.shaderSignedZeroInfNanPreserveFloat64;
     if (enabled.shaderFloat64) state->capabilities.push_back(spv::CapabilityFloat64);
     state->float64DenormPreserve = enabled.shaderFloat64 && floatControls.shaderDenormPreserveFloat64 == VK_TRUE &&
@@ -2384,6 +2428,8 @@ void VulkanDevice::PrepareForReplacement() {
 }
 
 void VulkanDevice::WaitIdle() {
+    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) gpuLock.lock();
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle begin");
     static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("wait idle"));
     RetirePresents(0);
@@ -2396,6 +2442,7 @@ void VulkanDevice::WaitIdle() {
     std::unique_lock presentQueueLock(state->presentQueueMutex, std::defer_lock);
     if (state->presentQueue != VK_NULL_HANDLE) presentQueueLock.lock();
     check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
+    Graphics::ReclaimIdleRetiredDepthSurfaces(state->device);
     Graphics::CheckPixelFunctionLds(graphicsContext());
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle complete");
 }
@@ -3373,7 +3420,7 @@ bool RefreshPresented(Graphics::StorageTexture& resident, const DisplayBuffer& b
     const auto bytes = DisplayBufferSize(buffer);
     if (!noAdopt) GuestMemory::AdoptLatestCollectEpoch();
     GuestMemory::CollectWritesUncached(buffer.address, bytes);
-    if (GuestMemory::UnchangedSince(buffer.address, bytes, resident.GenerationFor(buffer.address, bytes)) && (buffer.dccAddress == 0 || !ResidentKeysMoved(resident))) return false;
+    if (!Graphics::PendingStorageOverlaps(buffer.address, bytes, &resident) && GuestMemory::UnchangedSince(buffer.address, bytes, resident.GenerationFor(buffer.address, bytes)) && (buffer.dccAddress == 0 || !ResidentKeysMoved(resident))) return false;
     if (resident.ImageLayers() > 1) resident.RefreshLayers(layer, 1);
     else resident.Refresh();
     return true;
@@ -3387,6 +3434,7 @@ struct PlaneSource {
 
 PlaneSource OverlayPlaneSource(const Graphics::Context& context, const DisplayBuffer& buffer) {
     require(DisplayTexelBytes(buffer.pixelFormat) == 4u && !DisplayTenBit(buffer.pixelFormat) && !DisplayPq(buffer.pixelFormat), "VideoOut: only an 8-bit SDR overlay plane is composited over the main output");
+    Graphics::CompletePendingCpuWrites(context, buffer.address, DisplayBufferSize(buffer));
     PlaneSource source;
     if (!NoResidentPresent()) {
         VkFilter filter = VK_FILTER_LINEAR;
@@ -3451,6 +3499,8 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
     else Graphics::StorageTexture::FlushDumpSelected("flip");
+    Graphics::CompletePendingCpuWrites(graphicsContext(), buffer.address, DisplayBufferSize(buffer));
+    if (plane != nullptr) Graphics::CompletePendingCpuWrites(graphicsContext(), plane->address, DisplayBufferSize(*plane));
     auto& dumps = Dumps();
     const bool passthrough = state->surfaceColorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
     require(!passthrough || DisplayPq(buffer.pixelFormat), "only a PQ display buffer is presented to the HDR10 swapchain");
@@ -3490,6 +3540,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
     std::shared_ptr<Graphics::StorageTexture> resident;
     VkFilter filter = VK_FILTER_LINEAR;
     bool convert = false;
+    bool refreshed = false;
     std::uint32_t layer = 0;
     if (!NoResidentPresent()) {
         bool pending = false;
@@ -3503,7 +3554,8 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
         } else if (resident == nullptr) {
             ++unsuitable;
         } else {
-            if (RefreshPresented(*resident, buffer, layer)) ++refreshedPresents;
+            refreshed = RefreshPresented(*resident, buffer, layer);
+            if (refreshed) ++refreshedPresents;
             ++residentPresents;
         }
     }
@@ -3527,7 +3579,13 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
     if (cpuDump) QueueFrameDump(state->dumpWriter, *cpuDump, buffer.width, buffer.height, DisplayPixels(buffer, cleared));
     const bool cpuScreenshot = screenshot && passthrough && resident == nullptr;
     auto shot = cpuScreenshot ? DisplayPixels(buffer, cleared) : std::vector<std::byte>{};
-    CaptureTrace::Log("present dump=%d address=%llx width=%u height=%u resident=%d generation=%llu", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height, resident != nullptr, static_cast<unsigned long long>(resident ? resident->Generation() : 0));
+    if (CaptureTrace::Enabled()) {
+        const VkImage sourceImage = resident != nullptr ? resident->Image() : VK_NULL_HANDLE;
+        std::uint64_t imageBits = 0;
+        static_assert(sizeof(sourceImage) <= sizeof(imageBits));
+        std::memcpy(&imageBits, &sourceImage, sizeof(sourceImage));
+        CaptureTrace::Log("present dump=%d address=%llx width=%u height=%u resident=%d generation=%llu vk_image=%llx storage_object=%p device=%p vk_format=%d guest_format=%u image_layers=%u image_depth=%u selected_layer=%u image_width=%u image_height=%u mip_count=%u base_array=%u dimension=%u tile_mode=%u pipe_bank_xor=%u samples=%u swizzle=%u,%u,%u,%u image_dcc=%llx display_dcc=%llx display_format=%llx display_tiling=%u display_alignment=%llu convert=%d refreshed=%d", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height, resident != nullptr, static_cast<unsigned long long>(resident ? resident->Generation() : 0), static_cast<unsigned long long>(imageBits), static_cast<const void*>(resident.get()), static_cast<void*>(state->device), static_cast<int>(resident ? resident->ImageFormat() : VK_FORMAT_UNDEFINED), resident ? resident->Descriptor().format : 0u, resident ? resident->ImageLayers() : 0u, resident ? resident->ImageDepth() : 0u, layer, resident ? resident->Descriptor().width : 0u, resident ? resident->Descriptor().height : 0u, resident ? resident->Descriptor().mipCount : 0u, resident ? resident->Descriptor().baseArray : 0u, resident ? static_cast<unsigned>(resident->Descriptor().dimension) : 0u, resident ? static_cast<unsigned>(resident->Descriptor().tileMode) : 0u, resident ? resident->Descriptor().pipeBankXor : 0u, resident ? resident->Descriptor().samples : 0u, resident ? static_cast<unsigned>(resident->Descriptor().dstSelX) : 0u, resident ? static_cast<unsigned>(resident->Descriptor().dstSelY) : 0u, resident ? static_cast<unsigned>(resident->Descriptor().dstSelZ) : 0u, resident ? static_cast<unsigned>(resident->Descriptor().dstSelW) : 0u, static_cast<unsigned long long>(resident ? resident->Descriptor().dccAddress : 0), static_cast<unsigned long long>(buffer.dccAddress), static_cast<unsigned long long>(buffer.pixelFormat), buffer.tilingMode, static_cast<unsigned long long>(buffer.alignment), convert, refreshed);
+    }
     if (passthrough && resident == nullptr) ensureHdrScaler(DisplayTexelFormat(buffer.pixelFormat));
     VkClearColorValue uniform{};
     if (cleared && passthrough) {
@@ -3649,6 +3707,8 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     CaptureTrace::Log("blit dump=%d batch=%llu slot=%zu image=%u direct=%d", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(batchesAtBlit), state->presentCursor, index, direct);
     timing.Mark("pixel_upload");
     APS5_LOG_OUT_DEBUG("present source=%s bytes=%zu", pixels.empty() ? "clear" : "pixels", pixels.size());
+    static const bool sourceReadback = std::getenv("APS5_DUMP_PRESENT_SOURCE") != nullptr;
+    bool sourceRecorded = false;
     auto commands = slot.commands;
     check(state->DeviceFunction<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(commands, 0), "vkResetCommandBuffer");
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -3738,6 +3798,37 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             residentBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
             pipelineBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, residentStage, 0, 0, nullptr, 0, nullptr, 1, &residentBarrier);
             Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
+            if (sourceReadback && dumpFrame && !state->nextDumpScreenshot && drawn) {
+                const auto format = resident->ImageFormat();
+                const auto& descriptor = resident->Descriptor();
+                const bool supported = format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_SRGB;
+                const auto w = descriptor.width, h = descriptor.height;
+                if (supported && resident->ImageDepth() == 1 && descriptor.samples == 1 && residentLayer < resident->ImageLayers() && w && h && static_cast<std::uint64_t>(w) * h <= std::numeric_limits<std::size_t>::max() / 4) {
+                    const auto bytes = static_cast<std::size_t>(w) * h * 4;
+                    if (!slot.sourceBuffer || slot.sourceBuffer->Bytes().size() != bytes) slot.sourceBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                    auto transfer = residentBarrier;
+                    transfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    pipelineBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &transfer);
+                    VkBufferImageCopy region{};
+                    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, residentLayer, 1};
+                    region.imageExtent = {w, h, 1};
+                    state->DeviceFunction<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, slot.sourceBuffer->Handle(), 1, &region);
+                    VkBufferMemoryBarrier host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+                    host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                    host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    host.buffer = slot.sourceBuffer->Handle(); host.size = VK_WHOLE_SIZE;
+                    transfer.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; transfer.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    pipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 1, &host, 1, &transfer);
+                    slot.sourceWidth = w; slot.sourceHeight = h; slot.sourceLayer = residentLayer;
+                    slot.sourceFormat = format; slot.sourceGeneration = resident->Generation(); slot.sourceObject = resident.get();
+                    const auto source = resident->Image(); slot.sourceImage = 0;
+                    static_assert(sizeof(source) <= sizeof(slot.sourceImage));
+                    std::memcpy(&slot.sourceImage, &source, sizeof(source));
+                    sourceRecorded = true;
+                } else CaptureTrace::LogBestEffort("present-source-unsupported dump=%d vk_format=%d width=%u height=%u layer=%u", state->nextDumpIndex, static_cast<int>(format), w, h, residentLayer);
+            }
             if (residentConvert && !drawn) {
                 state->colorTransfer->DetileImage(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, Graphics::ColorTileMode::RenderTarget, DisplayRedLow(display->pixelFormat), DisplayTenBit(display->pixelFormat), DisplayHalfFloat(display->pixelFormat), residentLayer);
                 scaler->RecordUpload(commands, state->colorTransfer->LinearBuffer());
@@ -3790,7 +3881,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             }
         }
         if (resident != nullptr) {
-            residentBarrier.srcAccessMask = residentRead;
+            residentBarrier.srcAccessMask = residentRead | (sourceRecorded ? VK_ACCESS_TRANSFER_READ_BIT : 0);
             residentBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
             pipelineBarrier(commands, residentStage | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &residentBarrier);
             Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
@@ -3848,6 +3939,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         slot.shared = shared;
         // Only a submitted readback is written after the fence (a failed submit tears the device down).
         slot.dumpRecorded = dumpFrame;
+        slot.sourceRecorded = sourceRecorded;
         slot.dumpScreenshot = dumpFrame && state->nextDumpScreenshot;
         slot.dumpIndex = state->nextDumpIndex;
         slot.recorderSerial = batchesAtBlit;
@@ -4175,6 +4267,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.meshWave32 = state->meshWave32;
     context.provokingVertexLast = state->provokingVertexLast;
     context.graphicsPipelineLibrary = state->graphicsPipelineLibrary;
+    context.independentBlend = state->independentBlend;
     context.pipelineLinkTimeOptimization = state->pipelineLinkTimeOptimization;
     context.drawInputsInPlace = state->drawInputsInPlace;
     context.discreteGpu = state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;

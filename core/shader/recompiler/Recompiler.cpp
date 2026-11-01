@@ -1651,7 +1651,8 @@ void verifyPatchedResult(const RecompileResult& patched, const RecompileResult& 
 
 void reportResultMemo() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return;
+    static const bool cacheStats = std::getenv("APS5_CACHE_STATS") != nullptr;
+    if (!profile && !cacheStats) return;
     auto& counters = resultMemoCounters();
     const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = counters.lastReport.load(std::memory_order_relaxed);
@@ -1669,7 +1670,13 @@ void reportResultMemo() {
     const auto patching = counters.patchNanoseconds.exchange(0, std::memory_order_relaxed);
     const auto mismatches = counters.mismatches.exchange(0, std::memory_order_relaxed);
     const auto total = static_cast<double>(hits + patched + misses);
-    std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu patched, %llu misses (%.1f%% hits, %.1f%% patched), Populate %.1f us per miss / %.1f ms in total, patch %.1f us each / %.1f ms in total, %llu evictions, %llu patch mismatches, %llu trimmed; %llu results held, %.1f MiB\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(misses), total != 0.0 ? 100.0 * static_cast<double>(hits) / total : 0.0, total != 0.0 ? 100.0 * static_cast<double>(patched) / total : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, patched != 0 ? static_cast<double>(patching) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<double>(patching) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(trimmed), static_cast<unsigned long long>(counters.heldEntries.load(std::memory_order_relaxed)), static_cast<double>(counters.heldBytes.load(std::memory_order_relaxed)) / 1048576.0);
+    const auto tableReuse = ResourceMaterializer::TableReuse();
+    std::fprintf(stderr, "[recompile] image-table snapshot reuse (process totals): %llu columns, %llu compared, %llu shared, %llu unwritten, %llu requested_dwords, %llu resolutions, %llu resolutions_shared\n", static_cast<unsigned long long>(tableReuse.columns), static_cast<unsigned long long>(tableReuse.compared), static_cast<unsigned long long>(tableReuse.shared), static_cast<unsigned long long>(tableReuse.unwritten), static_cast<unsigned long long>(tableReuse.wordsRead), static_cast<unsigned long long>(tableReuse.resolutions), static_cast<unsigned long long>(tableReuse.resolutionsShared));
+    if (profile) {
+        std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu patched, %llu misses (%.1f%% hits, %.1f%% patched), Populate %.1f us per miss / %.1f ms in total, patch %.1f us each / %.1f ms in total, %llu evictions, %llu patch mismatches, %llu trimmed; %llu results held, %.1f MiB\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(misses), total != 0.0 ? 100.0 * static_cast<double>(hits) / total : 0.0, total != 0.0 ? 100.0 * static_cast<double>(patched) / total : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, patched != 0 ? static_cast<double>(patching) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<double>(patching) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(trimmed), static_cast<unsigned long long>(counters.heldEntries.load(std::memory_order_relaxed)), static_cast<double>(counters.heldBytes.load(std::memory_order_relaxed)) / 1048576.0);
+    } else {
+        std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu patched, %llu misses (%.1f%% hits, %.1f%% patched), %llu evictions, %llu patch mismatches, %llu trimmed; %llu results held, %.1f MiB (timings disabled)\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(misses), total != 0.0 ? 100.0 * static_cast<double>(hits) / total : 0.0, total != 0.0 ? 100.0 * static_cast<double>(patched) / total : 0.0, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(trimmed), static_cast<unsigned long long>(counters.heldEntries.load(std::memory_order_relaxed)), static_cast<double>(counters.heldBytes.load(std::memory_order_relaxed)) / 1048576.0);
+    }
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the

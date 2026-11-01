@@ -316,8 +316,25 @@ void StoreWordInBounds(SpirvValueEmitContext& ctx, const MemoryResourceAccess& r
         StoreMisalignedBits(ctx, resource, index, ConstantU32(state, 0xffffffffu), data);
         return;
     }
-    if (resource.memoryAccess != 0u) state.module.AddFunction(spv::OpStore, EmitMemoryElementPointer(state, resource, index), data, resource.memoryAccess);
-    else state.module.AddFunction(spv::OpStore, EmitMemoryElementPointer(state, resource, index), data);
+    const auto pointer = EmitMemoryElementPointer(state, resource, index);
+    const bool atomicWorkgroupLdsDword = resource.kind == ResourceKind::Lds
+        && state.program.Resources().stage == IrShaderStage::Compute
+        && ShaderWorkgroupInput(state) != nullptr
+        && !LdsInDeviceMemory(state)
+        && !state.pixelFunctionLdsBuffer
+        && !InFunctionStorage(state, resource.kind)
+        && !state.requirements.ldsLock
+        && !state.requirements.sharedInt64Atomics
+        && resource.memoryAccess == 0u;
+    if (atomicWorkgroupLdsDword) {
+        state.module.AddFunction(spv::OpAtomicStore, pointer,
+            ConstantU32(state, spv::ScopeWorkgroup),
+            ConstantU32(state, spv::MemorySemanticsMaskNone), data);
+    } else if (resource.memoryAccess != 0u) {
+        state.module.AddFunction(spv::OpStore, pointer, data, resource.memoryAccess);
+    } else {
+        state.module.AddFunction(spv::OpStore, pointer, data);
+    }
 }
 
 void StoreSubwordInBounds(SpirvValueEmitContext& ctx, const MemoryInfo& mem, const MemoryResourceAccess& resource, std::uint32_t address, std::uint32_t index, std::uint32_t bits, std::uint32_t data) {

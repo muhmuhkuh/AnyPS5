@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Cover_vert_spv.h"
@@ -34,6 +35,7 @@ constexpr std::uint32_t Drawn = 0xffffffffu;
 alignas(4096) std::array<std::byte, 2 * 65536> SurfaceStorage{};
 const std::span<std::byte, 65536> Surface{reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(SurfaceStorage.data()) + 65535u) & ~std::uintptr_t{65535u}), 65536};
 alignas(4096) std::array<std::uint8_t, 4096> Cmask{};
+alignas(4096) std::array<std::byte, 4096> Dcc{};
 
 ColorTarget target(ColorTileMode mode) {
     const ColorTargetLayout layout(Width, Height, mode, 4);
@@ -181,6 +183,79 @@ void oneFragment(AgcDriver::VulkanDevice& device) {
     expect(device, color, [](std::uint32_t, std::uint32_t) { return Stale; }, "a one-fragment target with CMASK codes 0xc and 0xf eliminated");
 }
 
+ColorTarget dccTarget(VkFormat format, std::uint32_t clear) {
+    auto color = target(ColorTileMode::RenderTarget);
+    color.coverageSamples = 4;
+    color.format = format;
+    color.clearWords = {clear, 0};
+    color.dccAddress = reinterpret_cast<std::uintptr_t>(Dcc.data());
+    color.dccPipeAligned = true;
+    color.dccAlphaOnMsb = true;
+    return color;
+}
+
+std::size_t keyCount(const ColorTarget& color) {
+    return DccKeyCount(ColorTextureTileMode(color.tileMode), color.elementBytes, Width, Height, color.bytes);
+}
+
+void prepareDcc(const ColorTarget& color, std::uint8_t key) {
+    prepare(color, [](std::uint32_t, std::uint32_t) { return true; });
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    Require(keyCount(color) <= Dcc.size(), "the CMASK/DCC fixture has insufficient metadata storage");
+    const std::vector<std::byte> keys(keyCount(color), std::byte{key});
+    AgcDriver::GuestMemory::Write(color.dccAddress, keys);
+}
+
+void expectDccExpanded(const ColorTarget& color, const std::string& what) {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    std::vector<std::byte> keys(keyCount(color));
+    AgcDriver::GuestMemory::Read(color.dccAddress, keys);
+    Require(std::all_of(keys.begin(), keys.end(), [](std::byte key) { return key == std::byte{0xff}; }), what + ": the complete DCC key range was not left uncompressed");
+}
+
+void matchingDccClear(AgcDriver::VulkanDevice& device, VkFormat format, std::uint32_t clear, std::uint8_t key, const std::string& name) {
+    const auto color = dccTarget(format, clear);
+    const auto drawn = format == VK_FORMAT_R32_SFLOAT ? 0x3f800000u : Drawn;
+    prepareDcc(color, key);
+    eliminate(device, color);
+    expect(device, color, [=](std::uint32_t, std::uint32_t) { return clear; }, name + " matching DCC/CMASK clear eliminated");
+    expectDccExpanded(color, name);
+    draw(device, color, {{0, 0}, {20, Height}});
+    expect(device, color, [=](std::uint32_t x, std::uint32_t) { return x < 20 ? drawn : clear; }, name + " left draw after the matching clear");
+    draw(device, color, {{40, 0}, {Width - 40, Height}});
+    expect(device, color, [=](std::uint32_t x, std::uint32_t) { return x < 20 || x >= 40 ? drawn : clear; }, name + " right draw preserved the earlier draw");
+    expectDccExpanded(color, name);
+    prepareDcc(color, key);
+    draw(device, color, {{0, 0}, {20, Height}});
+    expect(device, color, [=](std::uint32_t x, std::uint32_t) { return x < 20 ? drawn : clear; }, name + " matching clear materialized by the initial partial draw");
+    expectDccExpanded(color, name);
+}
+
+void refusedDccClear(AgcDriver::VulkanDevice& device, std::uint32_t clear, std::uint8_t key, const std::string& name, bool mixedTail = false) {
+    const auto color = dccTarget(VK_FORMAT_R32_SFLOAT, clear);
+    prepareDcc(color, key);
+    if (mixedTail) {
+        Require(keyCount(color) > DccKeyBytes(color.bytes), "the R_X CMASK/DCC fixture does not exercise padded DCC keys");
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        const std::array<std::byte, 1> expanded{std::byte{0xff}};
+        AgcDriver::GuestMemory::Write(color.dccAddress + keyCount(color) - 1, expanded);
+    }
+    expectRefused([&] { eliminate(device, color); }, "CMASK", name);
+}
+
+void oneFragmentDcc(AgcDriver::VulkanDevice& device) {
+    matchingDccClear(device, VK_FORMAT_R32_SFLOAT, 0, 0x00, "R32F zero");
+    matchingDccClear(device, VK_FORMAT_R32_SFLOAT, 0x3f000000u, 0x20, "R32F register 0.5");
+    matchingDccClear(device, VK_FORMAT_R8G8B8A8_UNORM, Clear, 0x20, "RGBA8 register");
+    matchingDccClear(device, VK_FORMAT_R8G8B8A8_UNORM, 0xff000000u, 0x40, "RGBA8 fixed alpha one");
+    refusedDccClear(device, 0x3f000000u, 0x00, "different DCC and CMASK clear texels");
+    refusedDccClear(device, 0x80000000u, 0x00, "negative-zero CMASK against positive-zero DCC");
+    refusedDccClear(device, 0, 0x00, "a mixed DCC key only in the padded R_X range", true);
+    refusedDccClear(device, 0, 0xff, "an uncompressed DCC target with CMASK clear");
+    refusedDccClear(device, 0, 0x10, "a comp-to-single DCC target with CMASK clear");
+    refusedDccClear(device, 0, 0x30, "an unknown DCC key with CMASK clear");
+}
+
 }
 
 int main() {
@@ -197,17 +272,20 @@ int main() {
             GuestAllocations::Mutation mutation;
             mutation.Add(SurfaceStorage.data(), SurfaceStorage.size(), true, true, true);
             mutation.Add(Cmask.data(), Cmask.size(), true, true, true);
+            mutation.Add(Dcc.data(), Dcc.size(), true, true, true);
         }
         run(*device, ColorTileMode::Linear, "linear");
         run(*device, ColorTileMode::RenderTarget, "SW_64KB_R_X");
         unknownCode(*device);
         oneFragment(*device);
+        oneFragmentDcc(*device);
         device->WaitIdle();
         device.reset();
         {
             GuestAllocations::Mutation mutation;
             mutation.Remove(SurfaceStorage.data());
             mutation.Remove(Cmask.data());
+            mutation.Remove(Dcc.data());
         }
         std::cout << "CMASK fast clear draw and eliminate tests passed\n";
         return 0;

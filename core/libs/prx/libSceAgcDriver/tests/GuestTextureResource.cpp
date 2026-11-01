@@ -6,8 +6,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include <algorithm>
 #include <array>
+#include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -88,22 +90,64 @@ void reject(TAction action, std::string_view reason) {
     throw std::runtime_error(std::string("expected guest texture rejection: ") + std::string(reason));
 }
 
+void rejectDecodeWords(std::span<const std::uint32_t> words, std::string_view reason) {
+    const auto decoded = TryDecodeTextureResource(words);
+    Require(!static_cast<bool>(decoded), "an invalid descriptor unexpectedly decoded");
+    Require(!decoded.error.empty(), "a failed try-decode returned no diagnostic");
+    std::string legacyError;
+    try {
+        DecodeTextureResource(words);
+    } catch (const std::runtime_error& error) {
+        legacyError = error.what();
+    }
+    Require(!legacyError.empty(), "the legacy decoder accepted an invalid descriptor");
+    Require(decoded.error == legacyError, "try-decode error text must exactly match the legacy exception");
+    Require(decoded.error.find(reason) != std::string::npos, std::string("unexpected guest texture test error: ") + decoded.error);
+}
+
 void rejectFields(const Fields& f, std::string_view reason) {
     const auto words = pack(f);
-    reject([&] { DecodeTextureResource(words); }, reason);
+    rejectDecodeWords(words, reason);
 }
+
+bool sameResource(const GuestTextureResource& left, const GuestTextureResource& right) {
+    return left.baseAddress == right.baseAddress
+        && left.width == right.width && left.height == right.height
+        && left.depthOrLastArray == right.depthOrLastArray && left.baseArray == right.baseArray
+        && left.mipCount == right.mipCount && left.baseLevel == right.baseLevel && left.lastLevel == right.lastLevel
+        && left.tileMode == right.tileMode && left.dimension == right.dimension && left.format == right.format
+        && left.dstSelX == right.dstSelX && left.dstSelY == right.dstSelY && left.dstSelZ == right.dstSelZ && left.dstSelW == right.dstSelW
+        && left.pipeBankXor == right.pipeBankXor && left.bcSwizzle == right.bcSwizzle
+        && left.dccAddress == right.dccAddress && left.dccAlphaOnMsb == right.dccAlphaOnMsb && left.dccPipeAligned == right.dccPipeAligned
+        && left.iterate256 == right.iterate256 && left.minLod == right.minLod && left.allocatedMipCount == right.allocatedMipCount
+        && left.samples == right.samples && left.fmaskCmaskAddress == right.fmaskCmaskAddress;
+}
+
+GuestTextureResource tryDecodeMatchesLegacy(std::span<const std::uint32_t> words, std::string_view context) {
+    const auto decoded = TryDecodeTextureResource(words);
+    Require(static_cast<bool>(decoded), std::string(context) + ": valid descriptor failed try-decode: " + decoded.error);
+    Require(decoded.error.empty(), std::string(context) + ": successful try-decode retained an error");
+    const auto legacy = DecodeTextureResource(words);
+    Require(sameResource(decoded.resource, legacy), std::string(context) + ": try-decode fields differ from the legacy ABI entry point");
+    return decoded.resource;
+}
+
+using LegacyTextureDecoder = GuestTextureResource (*)(std::span<const std::uint32_t>);
+static_assert(std::is_same_v<decltype(&DecodeTextureResource), LegacyTextureDecoder>);
 
 }
 
 static void RunR128TextureTests() {
     constexpr std::array<std::uint32_t, 8> streamed{0xa0c18800u, 0xcad00000u, 0x01ffc1ffu, 0x905b2facu, 0u, 0u, 0u, 0u};
     const auto view = DecodeTextureResource(streamed);
+    Require(sameResource(tryDecodeMatchesLegacy(streamed, "R128 streamed descriptor"), view), "R128 try-decode must preserve every decoded field");
     Require(view.baseAddress == 0xa0c1880000ull && view.format == 173u && view.tileMode == TextureTileMode::kStandard4KB && view.width == 512u && view.height == 512u && view.baseLevel == 0u && view.lastLevel == 9u && view.mipCount == 10u && view.allocatedMipCount == 10u && view.minLod == 0u,
         "a 128-bit BC3 T# (2048x2048, levels 2..11, words 4-7 zero) must read as the 512x512 chain of its 10 resident levels, got " + std::to_string(view.width) + "x" + std::to_string(view.height) + " levels " + std::to_string(view.baseLevel) + ".." + std::to_string(view.lastLevel) + " of " + std::to_string(view.mipCount));
     auto chainWords = streamed;
     chainWords[3] &= ~(0xfu << 12u);
     chainWords[5] = 11u << 4u;
     const auto full = DecodeTextureResource(chainWords);
+    Require(sameResource(tryDecodeMatchesLegacy(chainWords, "R128 full-chain descriptor"), full), "R128 full-chain try-decode must preserve every decoded field");
     Require(full.width == 2048u && full.mipCount == 12u, "the same surface with MAX_MIP 11 must be the 12-level 2048x2048 chain");
     const auto chain = DescribeSurface(full);
     const auto resident = DescribeSurface(view);
@@ -120,7 +164,7 @@ static void RunR128TextureTests() {
     Require(single.mipCount == 1u && single.lastLevel == 0u, "a T# with words 4-7 zero that starts at level 0 must stay one level");
     auto tailed = streamed;
     tailed[5] = 4u << 20u;
-    reject([&] { DecodeTextureResource(tailed); }, "would move the surface's own");
+    rejectDecodeWords(tailed, "would move the surface's own");
 
     constexpr std::array<std::uint32_t, 8> tall{0xa0c1de00u, 0xcad00000u, 0x01ffc0ffu, 0x905b4facu, 0u, 0u, 0u, 0u};
     const auto tallView = DecodeTextureResource(tall);
@@ -156,6 +200,8 @@ void RunGuestTextureResourceTests() {
     nullType.typeRaw = 2;
     Require(!IsNullTextureResource(pack(nullType)), "a reserved type-2 texture was classified as null");
     auto result = DecodeTextureResource(pack(base));
+    const auto tryBase = tryDecodeMatchesLegacy(baseWords, "base descriptor");
+    Require(sameResource(tryBase, result), "base try-decode must preserve every decoded field");
     Require(result.baseAddress == (base.base40 << 8u), "decoded base address changed");
     Require(result.width == 16 && result.height == 16, "decoded width or height changed");
     Require(result.depthOrLastArray == 0 && result.baseArray == 0, "decoded depth or base array changed");
@@ -306,6 +352,10 @@ void RunGuestTextureResourceTests() {
     pitched.maxMip = 1;
     pitched.lastLevel = 1;
     rejectFields(pitched, "custom pitch other than its default pitch");
+    Fields unknownPitchFormat = base;
+    unknownPitchFormat.format = 0x1ffu;
+    unknownPitchFormat.depth = 1u;
+    rejectFields(unknownPitchFormat, "unsupported guest texture format");
     twoD = base;
     twoD.baseArray = 1;
     rejectFields(twoD, "nonzero depth or base array");
@@ -707,7 +757,21 @@ void RunGuestTextureResourceTests() {
     RunR128TextureTests();
 
     std::array<std::uint32_t, 4> shortWords{};
-    reject([&] { DecodeTextureResource(shortWords); }, "8 dwords");
+    rejectDecodeWords(shortWords, "8 dwords");
+
+    Fields invalidBeforeRetry = base;
+    invalidBeforeRetry.typeRaw = 0xfu;
+    const auto invalidWords = pack(invalidBeforeRetry);
+    std::vector<std::uint32_t> dynamicWords(invalidWords.begin(), invalidWords.end());
+    const auto* allocation = dynamicWords.data();
+    const auto failedTry = TryDecodeTextureResource(dynamicWords);
+    Require(!static_cast<bool>(failedTry) && !failedTry.error.empty(), "the dynamic descriptor fixture must first fail try-decode");
+    constexpr std::array<std::uint32_t, 8> retryR128{0xa0c18800u, 0xcad00000u, 0x01ffc1ffu, 0x905b2facu, 0u, 0u, 0u, 0u};
+    std::copy(retryR128.begin(), retryR128.end(), dynamicWords.begin());
+    Require(dynamicWords.data() == allocation, "the retry must mutate the same descriptor allocation");
+    const auto recovered = tryDecodeMatchesLegacy(dynamicWords, "changed dynamic R128 descriptor");
+    Require(recovered.baseAddress == 0xa0c1880000ull && recovered.format == 173u && recovered.width == 512u && recovered.height == 512u && recovered.mipCount == 10u,
+        "a failed descriptor must not poison a later valid descriptor in the same dynamic storage");
 
     Require(MatchesGuestDimension(Shape::Image1D, TextureDimension::k1D), "1D shape must match 1D dimension");
     Require(!MatchesGuestDimension(Shape::Image1D, TextureDimension::k2D), "1D shape must not match 2D dimension");

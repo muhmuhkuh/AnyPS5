@@ -25,6 +25,7 @@
 namespace AgcDriver::Graphics {
 
 class Buffer;
+class Recorder;
 class ResidentColor;
 class CommandBatch;
 class StorageTexture;
@@ -45,7 +46,7 @@ bool ClearColorForTexel(VkFormat format, std::uint32_t elementBytes, std::span<c
 // A sampled texture's own VkImage with its memory, shared with the recorder while a recorded upload
 // still writes it (see the snapshot constructor), so the texture may go before the batch completes.
 struct OwnedImage {
-    OwnedImage(const Context& context, VkImage image, VkDeviceMemory memory) : context(context), image(image), memory(memory) {}
+    OwnedImage(const Context& context, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryBytes = 0, std::uint32_t memoryType = 0) : context(context), image(image), memory(memory), memoryBytes(memoryBytes), memoryType(memoryType) {}
     OwnedImage(const OwnedImage&) = delete;
     OwnedImage& operator=(const OwnedImage&) = delete;
     ~OwnedImage();
@@ -60,6 +61,7 @@ struct OwnedImage {
 class Texture {
 public:
     Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false);
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, const std::shared_ptr<Buffer>& snapshot, VkDeviceSize snapshotOffset = 0);
     Texture(const Context& context, const std::shared_ptr<ResidentColor>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     // A view of a storage image's own VkImage: the sampled texture follows the image's content, so a
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
@@ -105,6 +107,8 @@ public:
     // The layout the image is kept in while sampled.
     VkImageLayout Layout() const { return layout; }
     VkDeviceSize AllocationBytes() const { return allocationBytes; }
+    void KeepAllocationBytes(Recorder& recorder) const;
+    VkDeviceSize ReclaimableAllocationBytes() const { return owned != nullptr && owned.use_count() == 1 ? allocationBytes : 0; }
     VkFormat ViewFormat() const { return viewFormat; }
     // Whether this texture is a view of a storage image (no snapshot of its own).
     bool ViewsStorageImage() const { return storageSource != nullptr; }
@@ -122,6 +126,7 @@ public:
     void MarkReleased() { released.store(true, std::memory_order_release); }
 
 private:
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, const std::shared_ptr<Buffer>& snapshotBuffer, VkDeviceSize snapshotOffset);
     void release() noexcept;
     bool refreshBlockCopy();
     bool refreshSrgbExpand();

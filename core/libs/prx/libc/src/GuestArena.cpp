@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #ifndef _WIN32
 #include <cerrno>
@@ -482,11 +484,16 @@ void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, 
 
 void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("direct memory mapping", pointer, bytes);
+    static const bool sharedDirectMemory = [] {
+        const auto* value = std::getenv("APS5_DIRECT_MEMORY_SHARED");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
     std::vector<std::pair<std::uintptr_t, std::size_t>> created;
     std::exception_ptr failure;
     try {
-        WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), true, PAGE_EXECUTE_READWRITE, SIZE_MAX, &created);
+        WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), !sharedDirectMemory, PAGE_EXECUTE_READWRITE, SIZE_MAX, &created);
+        if (sharedDirectMemory) created.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     } catch (...) {
         failure = std::current_exception();
     }

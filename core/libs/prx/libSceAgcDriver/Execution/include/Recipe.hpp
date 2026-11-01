@@ -75,6 +75,7 @@ struct DrawRecipe {
     Graphics::ResourceCache::Key key;
     std::weak_ptr<Graphics::Pipeline> pipeline;
     std::weak_ptr<Graphics::Framebuffer> framebuffer;
+    std::weak_ptr<void> depthOwner;
     std::vector<std::weak_ptr<Graphics::StorageTexture>> targets;
     std::vector<VkImageView> targetViews;
     std::uint64_t passKey = 0;

@@ -36,6 +36,7 @@ private:
     VkDeviceSize allocationBytes = 0;
     VkDeviceSize offset = 0;
     bool slab = false;
+    std::uint32_t memoryType = 0;
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
     std::shared_ptr<BufferPool> cache;
@@ -61,6 +62,7 @@ private:
     std::size_t size;
     std::size_t capacity;
     VkDeviceSize allocationBytes = 0;
+    std::uint32_t memoryType = 0;
     VkBufferUsageFlags usage;
     std::shared_ptr<BufferPool> cache;
     bool hostPlaced = false;

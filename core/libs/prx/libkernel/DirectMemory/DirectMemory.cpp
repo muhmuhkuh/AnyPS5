@@ -34,6 +34,7 @@
 #else
 #include <windows.h>
 #include "prx/libc/include/WindowsDescriptor.hpp"
+#include "prx/libkernel/DirectMemory/WindowsSection.hpp"
 
 static constexpr int PROT_NONE = 0;
 static constexpr int PROT_READ = 1;
@@ -334,6 +335,14 @@ bool SectionPoolEnabled() {
     return enabled;
 }
 
+bool DirectMemoryFileBackingEnabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_DIRECT_MEMORY_FILE");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 class SectionPool {
 public:
     static SectionPool& Get() {
@@ -341,23 +350,23 @@ public:
         return *pool;
     }
 
-    HANDLE Take(std::size_t bytes) {
+    DirectMemoryWindows::SectionResource Take(std::size_t bytes) {
         std::lock_guard lock(mutex);
         const auto found = sections.find(bytes);
-        if (found == sections.end() || found->second.empty()) return nullptr;
-        const auto section = found->second.back();
+        if (found == sections.end() || found->second.empty()) return {};
+        const auto resource = found->second.back();
         found->second.pop_back();
         --count;
         pooledBytes -= bytes;
-        return section;
+        return resource;
     }
 
-    bool Keep(HANDLE section, std::size_t bytes) noexcept {
+    bool Keep(DirectMemoryWindows::SectionResource resource, std::size_t bytes) noexcept {
         if (bytes > MaxSectionBytes) return false;
         std::lock_guard lock(mutex);
         if (count == MaxSections || bytes > MaxPooledBytes - pooledBytes) return false;
         try {
-            sections[bytes].push_back(section);
+            sections[bytes].push_back(resource);
         } catch (const std::bad_alloc&) {
             return false;
         }
@@ -371,7 +380,7 @@ private:
     static constexpr std::size_t MaxSectionBytes = 16u << 20;
     static constexpr std::size_t MaxPooledBytes = 256u << 20;
     std::mutex mutex;
-    std::map<std::size_t, std::vector<HANDLE>> sections;
+    std::map<std::size_t, std::vector<DirectMemoryWindows::SectionResource>> sections;
     std::size_t count = 0;
     std::size_t pooledBytes = 0;
 };
@@ -383,14 +392,25 @@ public:
 #ifdef _WIN32
         static_cast<void>(start);
         const auto size = static_cast<std::uint64_t>(bytes);
-        if (SectionPoolEnabled()) section = SectionPool::Get().Take(bytes);
-        if (!section) section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
-        if (!section) {
-            const auto error = static_cast<int>(GetLastError());
-            char message[96];
-            std::snprintf(message, sizeof(message), "create direct memory backing of 0x%llx bytes (%llu MiB)", static_cast<unsigned long long>(size), static_cast<unsigned long long>((size + 0xFFFFF) >> 20));
-            throw std::system_error(error, std::system_category(), message);
+        const auto fileBacked = DirectMemoryFileBackingEnabled();
+        DirectMemoryWindows::SectionResource resource;
+        if (SectionPoolEnabled()) resource = SectionPool::Get().Take(bytes);
+        if (resource.section == nullptr) {
+            if (fileBacked) {
+                resource = DirectMemoryWindows::CreateFileBackedDirectMemorySection(size);
+            } else {
+                resource.section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE,
+                    static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
+                if (resource.section == nullptr) {
+                    const auto error = static_cast<int>(GetLastError());
+                    char message[96];
+                    std::snprintf(message, sizeof(message), "create direct memory backing of 0x%llx bytes (%llu MiB)", static_cast<unsigned long long>(size), static_cast<unsigned long long>((size + 0xFFFFF) >> 20));
+                    throw std::system_error(error, std::system_category(), message);
+                }
+            }
         }
+        section = resource.section;
+        sectionFile = resource.file;
 #else
         file = PhysicalFile();
         fileOffset = start;
@@ -416,11 +436,12 @@ public:
 
     ~PhysicalBacking() {
 #ifdef _WIN32
+        const DirectMemoryWindows::SectionResource resource{section, sectionFile};
         if (!SectionPoolEnabled()) {
             GuestArena::GuestArenaForgetSection_nid_postfix(section);
-            CloseHandle(section);
-        } else if (!GuestArena::GuestArenaForgetReusableSection_nid_no_patch(section) || !SectionPool::Get().Keep(section, bytes)) {
-            CloseHandle(section);
+            DirectMemoryWindows::CloseSectionResource(resource);
+        } else if (!GuestArena::GuestArenaForgetReusableSection_nid_no_patch(section) || !SectionPool::Get().Keep(resource, bytes)) {
+            DirectMemoryWindows::CloseSectionResource(resource);
         }
 #else
         if (hostWriteView != nullptr) ::munmap(hostWriteView, bytes);
@@ -443,6 +464,7 @@ private:
     std::size_t bytes;
 #ifdef _WIN32
     HANDLE section = nullptr;
+    HANDLE sectionFile = INVALID_HANDLE_VALUE;
 #else
     int file = -1;
     void* hostWriteView = nullptr;

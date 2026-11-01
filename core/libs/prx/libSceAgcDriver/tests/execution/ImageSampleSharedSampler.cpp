@@ -21,6 +21,7 @@ using ShaderRecompiler::ShaderStage;
 
 constexpr std::uint32_t Threads = 32;
 constexpr std::uint32_t Size = 8;
+constexpr std::uint32_t Format32UInt = 20;
 constexpr std::uint32_t Format32SInt = 21;
 constexpr std::uint32_t Format8888UNorm = 56;
 constexpr std::uint32_t Type2D = 9;
@@ -56,8 +57,8 @@ std::int32_t Integer(std::uint32_t x, std::uint32_t y) {
     return -static_cast<std::int32_t>(100u * x + 7u * y + 1u);
 }
 
-void Fill() {
-    const auto integerPitch = PitchBytes(Format32SInt, Integers.size());
+void Fill(std::uint32_t format) {
+    const auto integerPitch = PitchBytes(format, Integers.size());
     const auto colorPitch = PitchBytes(Format8888UNorm, Colors.size());
     Integers.fill(0x5au);
     Colors.fill(0x5au);
@@ -94,11 +95,11 @@ std::array<std::uint32_t, 8> TextureDescriptor(const void* texels, std::uint32_t
     };
 }
 
-void Run(AgcDriver::VulkanDevice& device) {
+void Run(AgcDriver::VulkanDevice& device, std::uint32_t format) {
     Output.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(24, 0u);
     const auto output = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size() * 4u));
-    const auto integers = TextureDescriptor(Integers.data(), Format32SInt, SwizzleX111);
+    const auto integers = TextureDescriptor(Integers.data(), format, SwizzleX111);
     const auto colors = TextureDescriptor(Colors.data(), Format8888UNorm, IdentitySwizzle);
     std::copy(output.begin(), output.end(), userData.begin());
     std::copy(integers.begin(), integers.end(), userData.begin() + 4);
@@ -119,20 +120,20 @@ void Run(AgcDriver::VulkanDevice& device) {
     device.WaitIdle();
 }
 
-void Check(AgcDriver::VulkanDevice& device) {
-    Fill();
-    Run(device);
+void Check(AgcDriver::VulkanDevice& device, std::uint32_t format) {
+    Fill(format);
+    Run(device, format);
     const std::array<std::uint32_t, 4> integer{static_cast<std::uint32_t>(Integer(SampleX, SampleY)), 1u, 1u, 1u};
     const std::array<float, 4> color{0.25f, 0.0f, 0.0f, 1.0f};
     for (std::uint32_t lane = 0; lane < Threads; ++lane) {
         for (std::uint32_t component = 0; component < 4u; ++component) {
             const auto actual = Output[lane * 8u + component];
-            Require(actual == integer[component], "32_SINT image_sample_lz through a bilinear sampler shared with 8_8_8_8_UNORM: lane " + std::to_string(lane) + " component " + std::to_string(component) + " is " + Hex(actual) + ", expected " + Hex(integer[component]));
+            Require(actual == integer[component], "integer format " + std::to_string(format) + " image_sample_lz through a bilinear sampler shared with 8_8_8_8_UNORM: lane " + std::to_string(lane) + " component " + std::to_string(component) + " is " + Hex(actual) + ", expected " + Hex(integer[component]));
         }
         for (std::uint32_t component = 0; component < 4u; ++component) {
             const auto bits = Output[lane * 8u + 4u + component];
             const auto actual = std::bit_cast<float>(bits);
-            Require(std::fabs(actual - color[component]) <= Tolerance, "8_8_8_8_UNORM image_sample_lz through a bilinear sampler shared with 32_SINT: lane " + std::to_string(lane) + " component " + std::to_string(component) + " is " + Hex(bits) + ", expected " + std::to_string(color[component]));
+            Require(std::fabs(actual - color[component]) <= Tolerance, "8_8_8_8_UNORM image_sample_lz through a bilinear sampler shared with integer format " + std::to_string(format) + ": lane " + std::to_string(lane) + " component " + std::to_string(component) + " is " + Hex(bits) + ", expected " + std::to_string(color[component]));
         }
     }
 }
@@ -143,7 +144,8 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        Check(*device);
+        Check(*device, Format32SInt);
+        Check(*device, Format32UInt);
         std::puts("image sample shared sampler tests passed");
         return 0;
     } catch (const std::exception& error) {

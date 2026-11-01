@@ -30,7 +30,7 @@ class Recorder;
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
-std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage = false);
+std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage = false, VkDevice device = VK_NULL_HANDLE);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
 std::uint64_t StorageTextureCeiling(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported);
 std::uint64_t StorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t sampledBytes, std::uint64_t storageBytes);
@@ -104,6 +104,7 @@ public:
         std::vector<VkDescriptorPoolSize> sizes;
         std::optional<std::uint32_t> variableCount;
         std::shared_ptr<const TableDescriptors> table;
+        std::uint64_t leaseOrder = 0;
     };
     SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt);
     void Free(const SetAllocation& allocation, std::shared_ptr<const TableDescriptors> table = {}) noexcept;
@@ -139,6 +140,7 @@ private:
     std::vector<VkDescriptorPool> dedicated;
     std::map<std::pair<VkDescriptorSetLayout, std::uint32_t>, std::vector<SetAllocation>> recycled;
     std::vector<SetAllocation> kept;
+    std::uint64_t nextLeaseOrder = 1;
     Stats stats;
 };
 
@@ -152,6 +154,8 @@ struct ImageTableReuseCounts {
     std::uint64_t replayed = 0;
     std::uint64_t writesKept = 0;
     std::uint64_t writesMade = 0;
+    std::uint64_t descriptorImagesWritten = 0;
+    std::uint64_t descriptorImagesKept = 0;
 };
 ImageTableReuseCounts ImageTableReuses();
 std::uint64_t SampledLookupKeyScans();

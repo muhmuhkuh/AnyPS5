@@ -5,9 +5,8 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
-#ifdef APS5_COUNT_MAPPING_QUERIES
 #include <atomic>
-#endif
+#include <cstdlib>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +25,26 @@ namespace GuestArena {
 class WindowsMappings {
 public:
     enum class Collection { All, Armed, Fresh };
+
+private:
+    enum class RefusalReason : std::size_t {
+        UnregisteredMapped, UnregisteredNonPrivate, Uncommitted, ComparedWhenShared, NoAccess,
+        ResidentWatchDisabled, FreshNoAccessUncollected, Count
+    };
+    struct View;
+    struct RefusalTraceCounts {
+        std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RefusalReason::Count)> reasons{};
+        std::atomic<std::uint64_t> total{0};
+    };
+    static bool refusalTraceEnabled() {
+        static const bool enabled = std::getenv("APS5_TRACE_WRITE_TRACKING") != nullptr;
+        return enabled;
+    }
+    static RefusalTraceCounts& refusalTraceCounts() {
+        static RefusalTraceCounts counts;
+        return counts;
+    }
+public:
 
     static WindowsMappings& Get() {
         static auto* mappings = new WindowsMappings;
@@ -468,16 +487,25 @@ public:
             if ((fresh == freshRanges.begin() || std::prev(fresh)->second <= address) && (fresh == freshRanges.end() || fresh->first >= end)) return true;
             for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
                 if (it->second.resident) {
-                    if (!watchResident) return false;
+                    if (!watchResident) {
+                        traceRefusal(RefusalReason::ResidentWatchDisabled, address, bytes, it->first, collection, clear, &it->second);
+                        return false;
+                    }
                     continue;
                 }
-                if (it->second.page->comparedWhenShared) return false;
+                if (it->second.page->comparedWhenShared) {
+                    traceRefusal(RefusalReason::ComparedWhenShared, address, bytes, it->first, collection, clear, &it->second);
+                    return false;
+                }
                 if (it->second.protection != PAGE_NOACCESS) continue;
                 for (auto at = std::max(address, it->first); at < std::min(end, it->first + pageBytes); at += 4096) {
-                    if ((it->second.collected & (1u << ((at - it->first) / 4096))) == 0) return false;
+                    if ((it->second.collected & (1u << ((at - it->first) / 4096))) == 0) {
+                        traceRefusal(RefusalReason::FreshNoAccessUncollected, address, bytes, at, collection, clear, &it->second);
+                        return false;
+                    }
                 }
             }
-        } else if (clear && !collectable(address, end)) return false;
+        } else if (clear && !collectable(address, end, address, bytes, collection, clear)) return false;
         auto position = views.lower_bound(address & ~(pageBytes - 1));
         std::uintptr_t cleanStart = 0;
         std::uintptr_t cleanEnd = 0;
@@ -498,7 +526,10 @@ public:
             const auto found = viewAt(base, position);
             if (found != views.end() && found->second.resident) {
                 flushClean();
-                if (!watchResident) return false;
+                if (!watchResident) {
+                    traceRefusal(RefusalReason::ResidentWatchDisabled, address, bytes, cursor, collection, clear, &found->second);
+                    return false;
+                }
                 const auto available = capacity - *count;
                 if (available == 0) return true;
                 const auto run = std::prev(residentRuns.upper_bound(cursor));
@@ -525,6 +556,7 @@ public:
                 }
                 if (view.protection == PAGE_NOACCESS) {
                     flushClean();
+                    traceRefusal(RefusalReason::NoAccess, address, bytes, cursor, collection, clear, &view);
                     return false;
                 }
                 const bool pinned = view.page->pins != 0;
@@ -621,19 +653,39 @@ public:
     }
 
 private:
-    bool collectable(std::uintptr_t address, std::uintptr_t end) {
+    bool collectable(std::uintptr_t address, std::uintptr_t end, std::uintptr_t callAddress, std::size_t callBytes,
+        Collection collection, bool clear) {
         const auto proven = collectableRanges.upper_bound(address);
         if (proven != collectableRanges.begin() && std::prev(proven)->second >= end) return true;
         auto position = views.lower_bound(address & ~(pageBytes - 1));
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
             if (const auto found = viewAt(base, position); found != views.end()) {
-                if (found->second.protection == PAGE_NOACCESS || (found->second.resident ? !watchResident : found->second.page->comparedWhenShared)) return false;
+                if (found->second.protection == PAGE_NOACCESS) {
+                    traceRefusal(RefusalReason::NoAccess, callAddress, callBytes, cursor, collection, clear, &found->second);
+                    return false;
+                }
+                if (found->second.resident && !watchResident) {
+                    traceRefusal(RefusalReason::ResidentWatchDisabled, callAddress, callBytes, cursor, collection, clear, &found->second);
+                    return false;
+                }
+                if (!found->second.resident && found->second.page->comparedWhenShared) {
+                    traceRefusal(RefusalReason::ComparedWhenShared, callAddress, callBytes, cursor, collection, clear, &found->second);
+                    return false;
+                }
                 cursor = std::min(end, base + pageBytes);
                 continue;
             }
             const auto allocationEnd = privateAllocationEnd(cursor);
-            if (allocationEnd == 0) return false;
+            if (allocationEnd == 0) {
+                if (refusalTraceEnabled()) {
+                    const auto memory = query(cursor);
+                    const auto reason = memory.State != MEM_COMMIT ? RefusalReason::Uncommitted :
+                        (memory.Type == MEM_MAPPED ? RefusalReason::UnregisteredMapped : RefusalReason::UnregisteredNonPrivate);
+                    traceRefusal(reason, callAddress, callBytes, cursor, collection, clear, nullptr, &memory);
+                }
+                return false;
+            }
             cursor = std::min(end, allocationEnd);
         }
         remember(collectableRanges, address, end);
@@ -735,6 +787,53 @@ private:
         bool aliasDemoted = false;
         std::uint8_t unreported = 0;
     };
+    void traceRefusal(RefusalReason reason, std::uintptr_t callAddress, std::size_t callBytes,
+        std::uintptr_t pageAddress, Collection collection, bool clear, const View* view = nullptr,
+        const MEMORY_BASIC_INFORMATION* memory = nullptr) {
+        if (!refusalTraceEnabled()) return;
+        auto& counts = refusalTraceCounts();
+        const auto index = static_cast<std::size_t>(reason);
+        if (index >= counts.reasons.size()) return;
+        const auto total = counts.total.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto reasonCount = counts.reasons[index].fetch_add(1, std::memory_order_relaxed) + 1;
+        static constexpr const char* names[] = {
+            "unregistered-mem-mapped", "unregistered-nonprivate", "uncommitted", "compared-when-shared",
+            "no-access", "resident-watch-disabled", "fresh-noaccess-uncollected"
+        };
+        const bool detail = total <= 64;
+        const bool summary = total > 64 && (total & (total - 1)) == 0 && total <= (std::uint64_t{1} << 24);
+        if (!detail && !summary) return;
+        if (detail) {
+            const auto sub = view != nullptr ? static_cast<std::size_t>((pageAddress & (pageBytes - 1)) / subpageBytes) : 0;
+            std::fprintf(stderr, "[write-trace] refusal #%llu reason=%s reason-count=%llu call=0x%llx+0x%zx page=0x%llx collection=%u clear=%u view=%u resident=%u watchResident=%u protect=0x%lx comparedShared=%u slotComparedShared=%u pins=%u aliases=%zu hostWrites=%u hostImports=%u armed=0x%x collected=0x%x sub=%zu seen=%llu pageGen=%llu state=0x%lx type=0x%lx allocationBase=%p region=0x%llx+0x%llx\n",
+                static_cast<unsigned long long>(total), names[index], static_cast<unsigned long long>(reasonCount),
+                static_cast<unsigned long long>(callAddress), callBytes, static_cast<unsigned long long>(pageAddress),
+                static_cast<unsigned>(collection), clear ? 1u : 0u, view != nullptr ? 1u : 0u, view != nullptr ? (view->resident ? 1u : 0u) : 0u, watchResident ? 1u : 0u,
+                view != nullptr ? static_cast<unsigned long>(view->protection) : 0ul,
+                view != nullptr ? (view->resident ? view->comparedWhenShared : view->page->comparedWhenShared) : 0u,
+                view != nullptr && view->slot != nullptr ? view->slot->comparedWhenShared : 0u,
+                view != nullptr ? (view->resident ? view->pins : view->page->pins) : 0u, view != nullptr && view->page != nullptr ? view->page->aliases.size() : 0u,
+                view != nullptr ? view->hostWrites : 0u, view != nullptr ? view->hostImports : 0u,
+                view != nullptr ? view->armed : 0u, view != nullptr ? view->collected : 0u, sub,
+                view != nullptr ? static_cast<unsigned long long>(view->seen[sub]) : 0ull,
+                view != nullptr && view->page != nullptr ? static_cast<unsigned long long>(view->page->generation[sub]) : 0ull,
+                memory != nullptr ? static_cast<unsigned long>(memory->State) : 0ul,
+                memory != nullptr ? static_cast<unsigned long>(memory->Type) : 0ul,
+                memory != nullptr ? memory->AllocationBase : nullptr,
+                static_cast<unsigned long long>(memory != nullptr ? reinterpret_cast<std::uintptr_t>(memory->BaseAddress) : 0),
+                static_cast<unsigned long long>(memory != nullptr ? memory->RegionSize : 0));
+        } else {
+            std::fprintf(stderr, "[write-trace] cumulative refusals total=%llu unregistered-mem-mapped=%llu unregistered-nonprivate=%llu uncommitted=%llu compared-when-shared=%llu no-access=%llu resident-watch-disabled=%llu fresh-noaccess-uncollected=%llu\n",
+                static_cast<unsigned long long>(total),
+                static_cast<unsigned long long>(counts.reasons[0].load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(counts.reasons[1].load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(counts.reasons[2].load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(counts.reasons[3].load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(counts.reasons[4].load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(counts.reasons[5].load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(counts.reasons[6].load(std::memory_order_relaxed)));
+        }
+    }
     struct Run {
         std::uintptr_t end;
         std::array<std::uint64_t, 8> collected;
@@ -910,13 +1009,20 @@ private:
         const auto run = std::prev(residentRuns.upper_bound(address));
         const auto start = run->first;
         const auto stop = run->second.end;
+        const auto first = views.find(start);
+        if (first == views.end()) throw std::runtime_error("resident guest run has no first view");
+        const auto section = first->second.section;
+        const auto offset = first->second.offset;
         const auto entry = indexEntry(run);
         const bool indexed = entry != residentIndex.end();
         std::vector<std::pair<std::shared_ptr<SharedPage>, std::shared_ptr<Physical>>> created;
         created.reserve((stop - start) / pageBytes);
         std::map<std::pair<std::uintptr_t, std::uint64_t>, std::shared_ptr<Physical>> staged;
         for (auto page = start; page < stop; page += pageBytes) {
-            const auto& view = views.at(page);
+            const auto found = views.find(page);
+            if (found == views.end() || found->second.section != section || found->second.offset != offset + (page - start) || !found->second.resident)
+                throw std::runtime_error("resident guest run is not a contiguous section mapping");
+            const auto& view = found->second;
             auto shared = std::make_shared<SharedPage>();
             shared->aliases.push_back(page);
             shared->pins = view.pins;
@@ -929,18 +1035,24 @@ private:
         }
         DWORD previous;
         if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("fence resident guest pages");
-        const auto section = views.at(start).section;
-        auto window = open(section->handle, views.at(start).offset, stop - start);
+        auto window = open(section->handle, offset, stop - start);
         if (query(reinterpret_cast<std::uintptr_t>(window.bytes)).State == MEM_RESERVE && !VirtualAlloc(window.bytes, stop - start, MEM_COMMIT, PAGE_READWRITE)) fail("commit direct memory pages");
         std::memcpy(window.bytes, reinterpret_cast<const void*>(start), stop - start);
         close(window);
         if (!VirtualFree(reinterpret_cast<void*>(start), stop - start, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("release resident guest pages");
         physical.merge(staged);
         for (auto& [key, slot] : staged) physical.find(key)->second = std::move(slot);
+        mapRun(start, stop - start, section->handle, offset);
+        for (auto page = start; page < stop;) {
+            const auto protection = views.at(page).protection;
+            auto end = page + pageBytes;
+            while (end < stop && views.at(end).protection == protection) end += pageBytes;
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(page), end - page, protection, &previous)) fail("protect a demoted run of shared guest pages");
+            page = end;
+        }
         for (auto page = start; page < stop; page += pageBytes) {
             auto& view = views.at(page);
-            split(page, pageBytes);
-            mapShared(page, view.section->handle, view.offset, view.protection);
             auto& [shared, slot] = created[(page - start) / pageBytes];
             view.page = std::move(shared);
             view.slot = std::move(slot);

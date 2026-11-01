@@ -38,9 +38,8 @@ struct SlabSlot {
 
 // Released buffer allocations kept for reuse, since creating, binding and mapping one costs tens of
 // microseconds and a build makes several. Small requests are served by size class (the next power of
-// two), so the many differently sized data and copied-region buffers of consecutive builds hit;
-// requests of a MiB and more keep their exact size (the multi-MiB registered-range snapshots repeat
-// exactly, and rounding them would waste pinned host memory). Retained allocations are evicted least
+// two), so the many differently sized data and copied-region buffers of consecutive builds hit.
+// Retained allocations are evicted least
 // recently used under a byte budget and a slot count, so a burst of small buffers between two large
 // builds no longer sweeps the large ones out. Free slots are kept per size, usage and memory
 // properties, so a lookup does not scan the other slots. Reuse is safe because a Buffer is only released once
@@ -63,15 +62,15 @@ public:
     ~BufferPool();
     BufferPool(const BufferPool&) = delete;
     BufferPool& operator=(const BufferPool&) = delete;
-    // The size a buffer for `bytes` is created with: its size class, or `bytes` itself when large.
-    static std::size_t Capacity(std::size_t bytes, VkMemoryPropertyFlags properties);
+    static std::size_t Capacity(std::size_t bytes);
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false);
     static VkDeviceSize ImageBudget(VkDeviceSize deviceBudget);
     VkDeviceMemory TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false);
     void PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept;
     std::size_t RetainedImages();
-    std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    std::optional<BufferAllocation> TakeExact(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    std::optional<BufferAllocation> TakeCompatible(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, const VkMemoryRequirements& requirements);
     void Put(const BufferAllocation& allocation) noexcept;
     VkDeviceSize ReclaimIdleDevice(VkDeviceSize bytes, std::chrono::steady_clock::time_point now);
     static bool SlabEligible(std::size_t capacity, VkDeviceSize alignment, VkDeviceSize size, VkDeviceSize atom);
@@ -137,6 +136,7 @@ private:
     // Moves the tier's least recently used slot (the oldest front of its lists) to `evicted`; the
     // caller destroys those after releasing the mutex, so builds taking buffers on other threads
     // do not wait behind the Vulkan destroy calls. Nothing changes when the vector cannot grow.
+    std::optional<BufferAllocation> take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, const VkMemoryRequirements* requirements, bool exactOnly);
     void evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted);
     bool evictOldestImage(std::vector<BufferAllocation>& evicted);
     bool imagePooled(VkDeviceSize bytes, std::uint32_t memoryType) const;
@@ -144,7 +144,7 @@ private:
     // The retained-slot bound of each tier (APS5_BUFFER_POOL_SLOTS, default `defaultSlots`), read once.
     static std::size_t MaxSlots();
     std::size_t maxSlots;
-    VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes, bool newImage);
+    VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes, bool newImage, VkDevice device);
     VkDevice device;
     PFN_vkUnmapMemory unmap;
     PFN_vkDestroyBuffer destroyBuffer;

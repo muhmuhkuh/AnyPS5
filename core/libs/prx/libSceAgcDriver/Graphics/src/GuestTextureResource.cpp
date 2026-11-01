@@ -10,16 +10,17 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace AgcDriver::Graphics {
 
 namespace {
 
-void requireValidDstSel(std::uint32_t value) {
-    Require(value == 0 || value == 1 || (value >= 4 && value <= 7), "guest texture descriptor has an invalid destination channel selector");
+bool validDstSel(std::uint32_t value) {
+    return value == 0 || value == 1 || (value >= 4 && value <= 7);
 }
 
-TextureTileMode resolveTileMode(std::uint32_t raw) {
+std::optional<TextureTileMode> tryResolveTileMode(std::uint32_t raw) {
     switch (raw) {
         case 0x00: return TextureTileMode::kLinear;
         case 0x01: return TextureTileMode::kStandard256B;
@@ -36,11 +37,11 @@ TextureTileMode resolveTileMode(std::uint32_t raw) {
         case 0x19: return TextureTileMode::kS64KBX;
         case 0x1a: return TextureTileMode::kD64KBX;
         case 0x1b: return TextureTileMode::kR64KBX;
-        default: throw std::runtime_error("AGC graphics: guest texture descriptor uses an unsupported tile mode " + std::to_string(raw));
+        default: return std::nullopt;
     }
 }
 
-TextureDimension resolveDimension(std::uint32_t raw) {
+std::optional<TextureDimension> tryResolveDimension(std::uint32_t raw) {
     switch (raw) {
         case 8: return TextureDimension::k1D;
         case 9: return TextureDimension::k2D;
@@ -49,8 +50,12 @@ TextureDimension resolveDimension(std::uint32_t raw) {
         case 12: return TextureDimension::k1DArray;
         case 13: return TextureDimension::k2DArray;
         case 14: return TextureDimension::k2DMsaa;
-        default: throw std::runtime_error("AGC graphics: guest texture descriptor uses an unsupported image type " + std::to_string(raw));
+        default: return std::nullopt;
     }
+}
+
+TextureDecodeResult decodeFailure(std::string reason) {
+    return {{}, "AGC graphics: " + std::move(reason)};
 }
 
 bool ZeroTail(std::span<const std::uint32_t> words) {
@@ -80,8 +85,12 @@ std::optional<std::array<std::uint32_t, 8>> R128ResidentLevelWords(std::span<con
     rebased[3] = (words[3] & ~(0xffu << 12u)) | (levels << 16u);
     rebased[5] = levels << 4u;
     try {
-        const auto chain = DescribeSurface(DecodeTextureResource(chainWords));
-        const auto view = DescribeSurface(DecodeTextureResource(rebased));
+        const auto chainDecode = TryDecodeTextureResource(chainWords);
+        if (!chainDecode) return std::nullopt;
+        const auto chain = DescribeSurface(chainDecode.resource);
+        const auto viewDecode = TryDecodeTextureResource(rebased);
+        if (!viewDecode) return std::nullopt;
+        const auto view = DescribeSurface(viewDecode.resource);
         if (chain.mips.size() != lastLevel + 1u || view.mips.size() != levels + 1u || chain.layers != view.layers) return std::nullopt;
         for (std::uint32_t level = baseLevel; level <= lastLevel; ++level) {
             if (!SameLevels(chain.mips[level], view.mips[level - baseLevel])) return std::nullopt;
@@ -101,12 +110,12 @@ bool IsNullTextureResource(std::span<const std::uint32_t> words) {
     return base40 == 0 || type <= 1;
 }
 
-GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words) {
-    Require(words.size() == 8, "guest texture descriptor must contain 8 dwords");
+TextureDecodeResult TryDecodeTextureResource(std::span<const std::uint32_t> words) {
+    if (words.size() != 8) return decodeFailure("guest texture descriptor must contain 8 dwords");
 
     const auto base40 = (static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1]) << 32u)) & 0xffffffffffull;
     auto baseAddress = base40 << 8u;
-    Require(baseAddress != 0, "guest texture descriptor has a null base address");
+    if (baseAddress == 0) return decodeFailure("guest texture descriptor has a null base address");
 
     const auto minLod = (words[1] >> 8u) & 0xfffu;
     const auto format = (words[1] >> 20u) & 0x1ffu;
@@ -144,10 +153,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     const auto dccColorTransf = ((words[6] >> 23u) & 0x1u) != 0;
     const auto metaAddr = ((static_cast<std::uint64_t>(words[6]) >> 24u) & 0xffu) | (static_cast<std::uint64_t>(words[7]) << 8u);
 
-    requireValidDstSel(dstSelX);
-    requireValidDstSel(dstSelY);
-    requireValidDstSel(dstSelZ);
-    requireValidDstSel(dstSelW);
+    if (!validDstSel(dstSelX) || !validDstSel(dstSelY) || !validDstSel(dstSelZ) || !validDstSel(dstSelW)) return decodeFailure("guest texture descriptor has an invalid destination channel selector");
 
     // The LOD warning threshold and mip statistics counters are texture-streaming feedback: the GPU
     // reports which mips were wanted. Nothing is reported back here, which only affects what the title
@@ -159,10 +165,10 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
             std::fprintf(stderr, "[gpu] texture streaming feedback (LOD warning / mip statistics) is not reported\n");
         }
     }
-    Require(!cornerSample, "guest texture descriptor uses corner sampling which is not implemented");
-    Require(!prtDefColor, "guest texture descriptor uses a partially resident default color which is not implemented");
-    Require(arrayPitch == 0, "guest texture descriptor uses a nonzero array pitch which is not implemented");
-    Require(!iterate256 || (typeRaw == 14u && tileModeRaw == 24u && (format == 7u || format == 22u)), "guest texture descriptor ITERATE_256 is implemented only for multisampled Z depth");
+    if (cornerSample) return decodeFailure("guest texture descriptor uses corner sampling which is not implemented");
+    if (prtDefColor) return decodeFailure("guest texture descriptor uses a partially resident default color which is not implemented");
+    if (arrayPitch != 0) return decodeFailure("guest texture descriptor uses a nonzero array pitch which is not implemented");
+    if (iterate256 && !(typeRaw == 14u && tileModeRaw == 24u && (format == 7u || format == 22u))) return decodeFailure("guest texture descriptor ITERATE_256 is implemented only for multisampled Z depth");
     static_cast<void>(maxUncompBlkSize);
     static_cast<void>(maxCompBlkSize);
     // Surfaces are always written uncompressed here (render targets and storage images bypass DCC), so
@@ -175,34 +181,34 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
             std::fprintf(stderr, "[gpu] texture DCC color transform is ignored (word6=0x%08x word7=0x%08x)\n", words[6], words[7]);
         }
     }
-    Require(bcSwizzle <= 5u, "guest texture descriptor uses a reserved BC swizzle");
+    if (bcSwizzle > 5u) return decodeFailure("guest texture descriptor uses a reserved BC swizzle");
 
-    Require(baseLevel <= lastLevel, "guest texture descriptor has a base mip level past its last mip level");
+    if (baseLevel > lastLevel) return decodeFailure("guest texture descriptor has a base mip level past its last mip level");
 
     const bool fmask = ShaderRecompiler::IsFmaskTextureFormat(static_cast<ShaderRecompiler::IrBufferFormat>(format));
     const auto fmaskLayout = ShaderRecompiler::FmaskLayoutOf(static_cast<ShaderRecompiler::IrBufferFormat>(format));
     if (fmask) {
-        Require(fmaskLayout.has_value(), "guest FMASK format is not implemented");
-        Require(!writeCompress && (!metaCompress || metaAddr != 0u), "FMASK CMASK compression is not implemented without readable metadata");
-        Require(!metaCompress || metaPipeAligned, "FMASK CMASK metadata must be pipe aligned");
-        Require(!metaCompress || format == static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Fmask32_S8_F8), "FMASK CMASK compression is implemented only for 8-sample, 8-fragment FMASK");
-        Require((typeRaw == 9u || typeRaw == 13u) && tileModeRaw == 24u && baseLevel == 0u && lastLevel == 0u && maxMip == 0u, "FMASK reads require a single-mip 2D or 2D-array Z_64KB_X surface");
+        if (!fmaskLayout.has_value()) return decodeFailure("guest FMASK format is not implemented");
+        if (writeCompress || (metaCompress && metaAddr == 0u)) return decodeFailure("FMASK CMASK compression is not implemented without readable metadata");
+        if (metaCompress && !metaPipeAligned) return decodeFailure("FMASK CMASK metadata must be pipe aligned");
+        if (metaCompress && format != static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Fmask32_S8_F8)) return decodeFailure("FMASK CMASK compression is implemented only for 8-sample, 8-fragment FMASK");
+        if (!((typeRaw == 9u || typeRaw == 13u) && tileModeRaw == 24u && baseLevel == 0u && lastLevel == 0u && maxMip == 0u)) return decodeFailure("FMASK reads require a single-mip 2D or 2D-array Z_64KB_X surface");
         const bool identity = format != static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Fmask32_S8_F8) && dstSelX == 4u && dstSelY == 5u && dstSelZ == 6u && dstSelW == 7u;
-        for (const auto selector : {dstSelX, dstSelY, dstSelZ, dstSelW}) Require(identity || selector == 0u || selector == 1u || selector == 4u, "FMASK destination channel selector is not implemented");
+        for (const auto selector : {dstSelX, dstSelY, dstSelZ, dstSelW}) {
+            if (!identity && selector != 0u && selector != 1u && selector != 4u) return decodeFailure("FMASK destination channel selector is not implemented");
+        }
     }
 
     const auto describe = [&] { return " (format " + std::to_string(format) + ", " + std::to_string(width) + "x" + std::to_string(height) + "x" + std::to_string(depth + 1) + ", type " + std::to_string(typeRaw) + ", tile " + std::to_string(tileModeRaw) + ", mips " + std::to_string(baseLevel) + ".." + std::to_string(lastLevel) + " of " + std::to_string(maxMip + 1) + ")"; };
-    TextureTileMode tileMode;
-    TextureDimension dimension;
-    try {
-        tileMode = resolveTileMode(tileModeRaw);
-        dimension = resolveDimension(typeRaw);
-    } catch (const std::exception& error) {
-        throw std::runtime_error(std::string(error.what()) + describe());
-    }
+    const auto tileModeResult = tryResolveTileMode(tileModeRaw);
+    if (!tileModeResult) return decodeFailure("guest texture descriptor uses an unsupported tile mode " + std::to_string(tileModeRaw) + describe());
+    const auto dimensionResult = tryResolveDimension(typeRaw);
+    if (!dimensionResult) return decodeFailure("guest texture descriptor uses an unsupported image type " + std::to_string(typeRaw) + describe());
+    const auto tileMode = *tileModeResult;
+    const auto dimension = *dimensionResult;
     std::uint32_t samples = 1;
     if (dimension == TextureDimension::k2DMsaa) {
-        Require(baseLevel == 0 && lastLevel >= 1u && lastLevel <= 4u && maxMip == lastLevel, "guest multisampled texture descriptor does not hold the same sample count of 2 to 16 in its last level and its last mip, which is not implemented" + describe());
+        if (!(baseLevel == 0 && lastLevel >= 1u && lastLevel <= 4u && maxMip == lastLevel)) return decodeFailure("guest multisampled texture descriptor does not hold the same sample count of 2 to 16 in its last level and its last mip, which is not implemented" + describe());
         samples = 1u << lastLevel;
         lastLevel = 0;
         maxMip = 0;
@@ -214,43 +220,49 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     if (XorSwizzleMode(tileMode) != 0) {
         pipeBankXor = static_cast<std::uint32_t>(baseAddress & (tileMode == TextureTileMode::kS4KBX || tileMode == TextureTileMode::kD4KBX ? 0xfffu : 0xffffu));
         baseAddress -= pipeBankXor;
-        Require(baseAddress != 0, "guest texture descriptor has a null base address");
+        if (baseAddress == 0) return decodeFailure("guest texture descriptor has a null base address");
     }
 
     switch (dimension) {
         case TextureDimension::k1D:
-            Require(height == 1 && depth == 0 && baseArray == 0, "guest 1D texture descriptor has a nonzero height, depth or base array");
+            if (!(height == 1 && depth == 0 && baseArray == 0)) return decodeFailure("guest 1D texture descriptor has a nonzero height, depth or base array");
             break;
         case TextureDimension::k2D:
             if (depth != 0 && tileMode == TextureTileMode::kLinear) {
-                const auto elementsPerPitchUnit = 256u / BytesPerElement(format);
+                std::uint32_t bytesPerElement = 0;
+                try {
+                    bytesPerElement = BytesPerElement(format);
+                } catch (const std::runtime_error& error) {
+                    return {{}, error.what()};
+                }
+                const auto elementsPerPitchUnit = 256u / bytesPerElement;
                 const auto defaultPitch = (width + elementsPerPitchUnit - 1u) / elementsPerPitchUnit * elementsPerPitchUnit;
-                Require(!IsBlockCompressed(format) && maxMip == 0 && baseArray == 0 && depth + 1u == defaultPitch, "guest 2D linear texture descriptor sets a custom pitch other than its default pitch, which is not implemented" + describe());
+                if (IsBlockCompressed(format) || maxMip != 0 || baseArray != 0 || depth + 1u != defaultPitch) return decodeFailure("guest 2D linear texture descriptor sets a custom pitch other than its default pitch, which is not implemented" + describe());
                 depth = 0;
             }
-            Require(depth == 0 && baseArray == 0, "guest 2D texture descriptor has a nonzero depth or base array");
+            if (depth != 0 || baseArray != 0) return decodeFailure("guest 2D texture descriptor has a nonzero depth or base array");
             break;
         case TextureDimension::k2DMsaa:
-            Require(depth == 0 && baseArray == 0, "guest multisampled 2D texture descriptor has a nonzero depth or base array");
+            if (depth != 0 || baseArray != 0) return decodeFailure("guest multisampled 2D texture descriptor has a nonzero depth or base array");
             break;
         case TextureDimension::k3D:
             // word4 DEPTH holds the depth minus one; BASE_ARRAY has no meaning for volumes.
-            Require(baseArray == 0, "guest 3D texture descriptor has a nonzero base array");
+            if (baseArray != 0) return decodeFailure("guest 3D texture descriptor has a nonzero base array");
             break;
         case TextureDimension::k2DArray:
-            Require(baseArray <= depth, "guest 2D array texture descriptor has a base array past its last array slice");
+            if (baseArray > depth) return decodeFailure("guest 2D array texture descriptor has a base array past its last array slice");
             break;
         case TextureDimension::k1DArray:
-            Require(height == 1, "guest 1D array texture descriptor has a nonzero height");
-            Require(baseArray <= depth, "guest 1D array texture descriptor has a base array past its last array slice");
-            Require(tileMode == TextureTileMode::kLinear || tileMode == TextureTileMode::kZ64KBX || tileMode == TextureTileMode::kR64KBX, "guest 1D array texture descriptor uses a tile mode other than linear, Z or R, which 1D resources cannot use");
+            if (height != 1) return decodeFailure("guest 1D array texture descriptor has a nonzero height");
+            if (baseArray > depth) return decodeFailure("guest 1D array texture descriptor has a base array past its last array slice");
+            if (!(tileMode == TextureTileMode::kLinear || tileMode == TextureTileMode::kZ64KBX || tileMode == TextureTileMode::kR64KBX)) return decodeFailure("guest 1D array texture descriptor uses a tile mode other than linear, Z or R, which 1D resources cannot use");
             break;
         case TextureDimension::kCube:
-            Require(width == height, "guest cube texture descriptor is not square");
-            Require(baseArray <= depth, "guest cube texture descriptor has a base array past its last array slice");
+            if (width != height) return decodeFailure("guest cube texture descriptor is not square");
+            if (baseArray > depth) return decodeFailure("guest cube texture descriptor has a base array past its last array slice");
             if (baseArray == depth) depth += 5u;
             if (depth - baseArray + 1u < 6u) {
-                Require(false, "guest cube texture descriptor holds fewer than 6 array slices" +
+                return decodeFailure("guest cube texture descriptor holds fewer than 6 array slices" +
                     describe() + " (base array " + std::to_string(baseArray) + ")");
             }
             break;
@@ -283,14 +295,26 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     result.minLod = minLod;
     result.samples = samples;
     if (baseLevel > maxMip) {
-        const bool fits = LevelsFitAllocation(result, lastLevel + 1u);
-        if (!fits && ZeroTail(words)) {
-            if (const auto resident = R128ResidentLevelWords(words)) return DecodeTextureResource(*resident);
+        bool fits = false;
+        try {
+            fits = LevelsFitAllocation(result, lastLevel + 1u);
+        } catch (const std::runtime_error& error) {
+            return {{}, error.what()};
         }
-        Require(fits, "guest texture descriptor starts past the surface's last mip level at levels that would move the surface's own" + describe());
+        if (!fits && ZeroTail(words)) {
+            if (const auto resident = R128ResidentLevelWords(words)) return TryDecodeTextureResource(*resident);
+        }
+        if (!fits) return decodeFailure("guest texture descriptor starts past the surface's last mip level at levels that would move the surface's own" + describe());
         result.mipCount = lastLevel + 1u;
     }
-    return result;
+    return {result, {}};
+}
+
+
+GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words) {
+    auto result = TryDecodeTextureResource(words);
+    if (!result) throw std::runtime_error(result.error);
+    return result.resource;
 }
 
 std::array<std::uint32_t, 8> EncodeTextureResource(const GuestTextureResource& resource) {

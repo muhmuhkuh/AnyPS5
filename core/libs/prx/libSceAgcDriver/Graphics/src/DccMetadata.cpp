@@ -504,10 +504,14 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
             recorder->SyncThrough(metaAddress, count);
         }
     }
-    const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
-    const auto first = keys[0];
+    std::vector<std::uint8_t> keys(count);
+    if (GuestMemory::CopyMapped(metaAddress, std::as_writable_bytes(std::span(keys))) != GuestMemory::Compare::Equal) {
+        memoized = true;
+        return DccKeys::Unreadable;
+    }
+    const auto first = keys.front();
     const auto start = ScanProfileEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const bool uniform = AllKeysEqual(keys + 1, count - 1, first);
+    const bool uniform = AllKeysEqual(keys.data() + 1, count - 1, first);
     if (ScanProfileEnabled()) CountScan(count, start);
     return uniform ? ByteKeys(first) : DccKeys::Mixed;
 }

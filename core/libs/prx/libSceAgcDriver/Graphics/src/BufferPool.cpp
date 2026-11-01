@@ -76,7 +76,7 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         }
     }
     if (exhausted(result)) {
-        if (cacheReclaim != nullptr) released = cacheReclaim(ReclaimTarget(allocation.allocationSize), newImage);
+        if (cacheReclaim != nullptr) released = cacheReclaim(ReclaimTarget(allocation.allocationSize), newImage, device);
         if (released != 0) {
             reclaimed += trim();
             memory = VK_NULL_HANDLE;
@@ -369,13 +369,14 @@ bool BufferPool::DeviceTiered(VkMemoryPropertyFlags properties) {
     return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0 && DeviceTierEnabled();
 }
 
-std::size_t BufferPool::Capacity(std::size_t bytes, VkMemoryPropertyFlags properties) {
+std::size_t BufferPool::Capacity(std::size_t bytes) {
     constexpr std::size_t smallest = 256;
     if (exactSizes()) return bytes;
     if (bytes < classLimit) return std::max(smallest, std::bit_ceil(bytes));
-    if (!DeviceTiered(properties)) return bytes;
     const auto step = std::bit_floor(bytes) >> deviceClassBits;
-    return (bytes + step - 1) / step * step;
+    const auto remainder = bytes % step;
+    const auto padding = remainder == 0 ? 0u : step - remainder;
+    return bytes > std::numeric_limits<std::size_t>::max() - padding ? bytes : bytes + padding;
 }
 
 std::size_t BufferPool::NextCapacity(std::size_t capacity) {
@@ -391,9 +392,17 @@ BufferPool::Tier& BufferPool::tierFor(std::size_t capacity, VkMemoryPropertyFlag
     return !sharedTiers() && capacity < classLimit ? smallTier : largeTier;
 }
 
-std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) {
+std::optional<BufferAllocation> BufferPool::TakeExact(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) {
+    return take(bytes, usage, properties, nullptr, true);
+}
+
+std::optional<BufferAllocation> BufferPool::TakeCompatible(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, const VkMemoryRequirements& requirements) {
+    return take(bytes, usage, properties, &requirements, false);
+}
+
+std::optional<BufferAllocation> BufferPool::take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, const VkMemoryRequirements* requirements, bool exactOnly) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    const auto capacity = Capacity(bytes, properties);
+    const auto capacity = Capacity(bytes);
     std::lock_guard lock(mutex);
     ++clock;
     if (profile) {
@@ -407,16 +416,48 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
     auto& tier = tierFor(capacity, properties);
     const auto largest = &tier == &deviceTier && !exactSizes() && bytes <= std::numeric_limits<std::size_t>::max() / 2 ? std::max(capacity, bytes * 2) : capacity;
     auto found = tier.free.end();
-    for (auto size = capacity; size <= largest && found == tier.free.end(); size = NextCapacity(size)) found = tier.free.find({size, usage, properties});
-    if (found == tier.free.end() || found->second.empty()) {
-        ++tier.misses;
+    std::deque<Slot>::iterator chosen;
+    for (auto size = capacity; size <= largest;) {
+        const auto bucket = tier.free.find({size, usage, properties});
+        if (bucket != tier.free.end() && !bucket->second.empty()) {
+            auto candidate = bucket->second.end();
+            if (exactOnly) {
+                const auto newest = std::prev(bucket->second.end());
+                auto exact = newest;
+                for (std::size_t scanned = 1; exact->allocation.bufferBytes != bytes && scanned < exactSizeScan && exact != bucket->second.begin(); ++scanned) --exact;
+                if (exact->allocation.bufferBytes == bytes) candidate = exact;
+            } else {
+                std::size_t scanned = 0;
+                for (auto entry = bucket->second.end(); entry != bucket->second.begin() && scanned < exactSizeScan;) {
+                    --entry;
+                    ++scanned;
+                    const auto& allocation = entry->allocation;
+                    if (allocation.bufferBytes == bytes || (
+                        allocation.buffer != VK_NULL_HANDLE && allocation.bytes >= bytes && allocation.memoryType < 32u &&
+                        (requirements->memoryTypeBits & (std::uint32_t{1} << allocation.memoryType)) != 0 &&
+                        requirements->size <= allocation.allocationBytes &&
+                        (requirements->alignment == 0 || allocation.offset % requirements->alignment == 0))) {
+                        candidate = entry;
+                        break;
+                    }
+                }
+            }
+            if (candidate != bucket->second.end()) {
+                found = bucket;
+                chosen = candidate;
+                break;
+            }
+        }
+        if (size == largest) break;
+        const auto next = NextCapacity(size);
+        if (next <= size) break;
+        size = next;
+    }
+    if (found == tier.free.end()) {
+        if (!exactOnly) ++tier.misses;
         return std::nullopt;
     }
     auto& slots = found->second;
-    const auto newest = std::prev(slots.end());
-    auto chosen = newest;
-    for (std::size_t scanned = 1; chosen->allocation.bufferBytes != bytes && scanned < exactSizeScan && chosen != slots.begin(); ++scanned) --chosen;
-    if (chosen->allocation.bufferBytes != bytes) chosen = newest;
     auto result = chosen->allocation;
     slots.erase(chosen);
     if (slots.empty()) tier.free.erase(found);

@@ -155,8 +155,9 @@ void CheckDrawn(PipelineTrace& trace, bool optimized) {
     Require(std::find(expected.begin(), expected.end(), trace.drawn.front()) != expected.end(), optimized ? "readback draw did not bind an optimized pipeline" : "readback draw did not bind a fast-linked pipeline");
 }
 
-void Run(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace, std::uint32_t waveSize, VkFormat depthFormat, bool optimize) {
+void Run(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace, std::uint32_t waveSize, VkFormat depthFormat, bool optimize, bool evictionVariant = false, std::uint64_t expectedLinkDelta = 1) {
     const bool masked = depthFormat == VK_FORMAT_UNDEFINED;
+    const auto linksBefore = PipelineLibraryCountersOf(context.device).linked;
     const auto target = device.Target();
     const auto vertices = masked ? std::span<const std::array<float, 4>>(Triangle) : std::span<const std::array<float, 4>>(DepthTriangles);
     const auto vertexBuffer = BufferDescriptor(vertices.data(), 16u, static_cast<std::uint32_t>(vertices.size()));
@@ -199,13 +200,15 @@ void Run(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace,
     state.colors = {state.color};
     state.hasColorTarget = true;
     state.renderExtent = {Width, Height};
-    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.topology = evictionVariant ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    if (evictionVariant) state.provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
     state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
     state.negativeOneToOne = false;
     state.scissor = {{0, 0}, {Width, Height}};
     state.cullMode = VK_CULL_MODE_NONE;
     state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     state.blend.colorWriteMask = 15;
+    if (evictionVariant) state.blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
     state.blends = {state.blend};
     if (!masked) {
         state.depth = DepthTarget{reinterpret_cast<std::uintptr_t>(DepthMemory.data()), 0, {Width, Height}, depthFormat, 0.5f, 0};
@@ -231,7 +234,7 @@ void Run(AgcDriver::VulkanDevice& device, Context context, PipelineTrace& trace,
     }
     trace.ReleaseOptimization();
     WaitForOptimizedPipelines(context.device);
-    Require(PipelineLibraryCountersOf(context.device).linked == 1, "the readback pipeline was not linked from graphics libraries");
+    Require(PipelineLibraryCountersOf(context.device).linked == linksBefore + expectedLinkDelta, "the readback pipeline link count did not match the expected pipeline-cache lookup");
     Require(trace.optimized.size() == (optimize ? 1u : 0u), "the optimized pipeline creation count differs from the requested mode");
     render(optimize, "completed link");
     std::printf("pipeline readback passed: fast draws %u, optimized draws %u, optimized creations %zu, libraries %u (%u retaining link-time optimization info)\n", optimize ? 1u : 2u, optimize ? 1u : 0u, trace.optimized.size(), trace.libraries, trace.retaining);
@@ -243,9 +246,11 @@ int main(int argc, char** argv) {
     try {
         std::string_view mode = "d32";
         bool force = false;
+        bool libraryEviction = false;
         for (int index = 1; index < argc; ++index) {
             const std::string_view argument = argv[index];
             if (argument == "--force-lto") force = true;
+            else if (argument == "--library-eviction") libraryEviction = true;
             else {
                 Require(argument == "color32" || argument == "color64" || argument == "d32" || argument == "d16", "unknown pipeline readback case");
                 mode = argument;
@@ -279,7 +284,24 @@ int main(int argc, char** argv) {
         context.deviceProc = Resolve;
         OptimizationDrain drain{context.device};
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        Run(*device, context, trace, mode == "color32" ? 32u : 64u, masked ? VK_FORMAT_UNDEFINED : (mode == "d16" ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT), optimize);
+        if (libraryEviction) {
+            Require(!optimize && !force, "the library eviction readback must use fast-linked pipelines");
+            Require(device->Target().subgroupSize >= 32u, "the library eviction readback requires a 32-lane subgroup for its masked variant");
+            const auto evictedBefore = PipelineLibraryCountersOf(context.device).evicted;
+            Run(*device, context, trace, 64u, VK_FORMAT_D32_SFLOAT, false, false, 1u);
+            const auto firstPipeline = trace.drawn.at(0);
+            const auto evictedAfterFirst = PipelineLibraryCountersOf(context.device).evicted;
+            Run(*device, context, trace, 32u, VK_FORMAT_UNDEFINED, false, true, 1u);
+            const auto secondPipeline = trace.drawn.at(0);
+            Require(firstPipeline != secondPipeline, "the alternate shader program did not create a distinct linked pipeline");
+            const auto evictedAfterSecond = PipelineLibraryCountersOf(context.device).evicted;
+            for (std::size_t part = 0; part < 4; ++part) Require(evictedAfterSecond[part] > evictedAfterFirst[part] && evictedAfterFirst[part] >= evictedBefore[part], "the GPU readback did not evict a library from every GPL part");
+            Run(*device, context, trace, 64u, VK_FORMAT_D32_SFLOAT, false, false, 0u);
+            Require(trace.drawn.at(0) == firstPipeline, "the original linked pipeline was not reused after its libraries left the GPL cache");
+            std::puts("pipeline-library eviction readback passed with the original linked pipeline after all four part caches evicted it");
+        } else {
+            Run(*device, context, trace, mode == "color32" ? 32u : 64u, masked ? VK_FORMAT_UNDEFINED : (mode == "d16" ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT), optimize);
+        }
         if (optimize) Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 1, "the optimized pipeline was not built on the pipeline library worker");
         AgcDriver::Graphics::StopPipelineLibraryWorker();
         Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 0, "stopping the pipeline library left its worker running");

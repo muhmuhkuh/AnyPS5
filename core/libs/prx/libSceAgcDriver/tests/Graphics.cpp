@@ -5212,6 +5212,20 @@ std::condition_variable pipelineCreateCondition;
 bool blockLibraryCreate = false;
 bool libraryCreateEntered = false;
 bool releaseLibraryCreate = false;
+std::mutex pipelineHandleMutex;
+std::condition_variable pipelineHandleCondition;
+std::set<VkPipeline> libraryHandles;
+std::set<VkPipeline> linkedHandles;
+std::set<VkPipeline> optimizedHandles;
+std::map<VkPipeline, std::uint32_t> pipelineDestroyCounts;
+std::uint64_t pipelineDestroyCallbacks = 0;
+std::uint64_t pipelineLayoutDestroyCallbacks = 0;
+std::uint64_t shaderModuleDestroyCallbacks = 0;
+bool pipelineDeviceAlive = true;
+bool pipelineDestroyAfterDeviceDeath = false;
+bool blockOptimizedCreate = false;
+bool optimizedCreateEntered = false;
+bool releaseOptimizedCreate = false;
 
 template<typename THandle>
 THandle makeHandle() {
@@ -5423,6 +5437,14 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreatePipelineLayout(VkDevice, const VkPipeli
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineCache, std::uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* pipelines) {
+    if (count != 0 && (infos[0].flags & VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT) != 0) {
+        std::unique_lock lock(pipelineCreateMutex);
+        if (blockOptimizedCreate) {
+            optimizedCreateEntered = true;
+            pipelineCreateCondition.notify_all();
+            pipelineCreateCondition.wait(lock, [] { return releaseOptimizedCreate; });
+        }
+    }
     {
         std::unique_lock lock(pipelineCreateMutex);
         if (blockLibraryCreate) {
@@ -5436,6 +5458,11 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineC
         const auto* linked = static_cast<const VkPipelineLibraryCreateInfoKHR*>(infos[0].pNext);
         Require(linked != nullptr && linked->sType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR && linked->libraryCount != 0, "mock expects a graphics pipeline library or a pipeline linked from libraries");
         *pipelines = makeHandle<VkPipeline>();
+        {
+            std::lock_guard lock(pipelineHandleMutex);
+            linkedHandles.insert(*pipelines);
+            if ((infos[0].flags & VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT) != 0) optimizedHandles.insert(*pipelines);
+        }
         ++mock.pipelineCreateCount;
         ++mock.live;
         return VK_SUCCESS;
@@ -5444,11 +5471,20 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineC
     Require(library != nullptr && library->sType == VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, "missing graphics pipeline library description");
     mock.libraryLayouts[library->flags] = infos[0].layout;
     *pipelines = makeHandle<VkPipeline>();
+    {
+        std::lock_guard lock(pipelineHandleMutex);
+        libraryHandles.insert(*pipelines);
+    }
     ++mock.live;
     return VK_SUCCESS;
 }
 
 VKAPI_ATTR void VKAPI_CALL mockDestroyPipelineLayout(VkDevice, VkPipelineLayout, const VkAllocationCallbacks*) {
+    {
+        std::lock_guard lock(pipelineHandleMutex);
+        if (!pipelineDeviceAlive) pipelineDestroyAfterDeviceDeath = true;
+        ++pipelineLayoutDestroyCallbacks;
+    }
     --mock.live;
 }
 
@@ -5459,7 +5495,14 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateShaderModule(VkDevice, const VkShaderMo
 }
 
 VKAPI_ATTR void VKAPI_CALL mockDestroyShaderModule(VkDevice, VkShaderModule module, const VkAllocationCallbacks*) {
-    if (module != VK_NULL_HANDLE) --mock.live;
+    if (module != VK_NULL_HANDLE) {
+        {
+            std::lock_guard lock(pipelineHandleMutex);
+            if (!pipelineDeviceAlive) pipelineDestroyAfterDeviceDeath = true;
+            ++shaderModuleDestroyCallbacks;
+        }
+        --mock.live;
+    }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateComputePipelines(VkDevice, VkPipelineCache, std::uint32_t count, const VkComputePipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* pipelines) {
@@ -5477,7 +5520,14 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateComputePipelines(VkDevice, VkPipelineCa
     return VK_SUCCESS;
 }
 
-VKAPI_ATTR void VKAPI_CALL mockDestroyPipeline(VkDevice, VkPipeline, const VkAllocationCallbacks*) {
+VKAPI_ATTR void VKAPI_CALL mockDestroyPipeline(VkDevice, VkPipeline pipeline, const VkAllocationCallbacks*) {
+    {
+        std::lock_guard lock(pipelineHandleMutex);
+        if (!pipelineDeviceAlive) pipelineDestroyAfterDeviceDeath = true;
+        ++pipelineDestroyCallbacks;
+        ++pipelineDestroyCounts[pipeline];
+    }
+    pipelineHandleCondition.notify_all();
     --mock.live;
 }
 
@@ -5913,9 +5963,10 @@ void depthCopyKeptBytesTests() {
             Recorder recorder(context);
             recorder.Activate();
             for (unsigned batch = 0; batch < 3; ++batch) {
-                recorder.Keep(std::make_shared<int>(0), Recorder::KeptBytesBudget - bytes);
                 {
                     Texture depth(context, source, resource, {}, Texture::DepthCopyTag{});
+                    Require(depth.AllocationBytes() != 0 && depth.AllocationBytes() < Recorder::KeptBytesBudget - bytes, "depth-copy fixture has an invalid image allocation size");
+                    recorder.Keep(std::make_shared<int>(0), Recorder::KeptBytesBudget - bytes - static_cast<std::size_t>(depth.AllocationBytes()));
                     Require(depth.RefreshDepthCopy(), "a fresh depth copy did not record its linear transfer");
                     const auto begin = batch * 4;
                     Require(mock.imageBufferCopies.size() == begin + 4, "a depth refresh did not copy both mips through its linear buffer");
@@ -5930,7 +5981,7 @@ void depthCopyKeptBytesTests() {
                     }
                     Require(!depth.RefreshDepthCopy() && mock.imageBufferCopies.size() == begin + 4, "an unchanged storage version made another linear depth copy");
                 }
-                Require(recorder.OpenKeptBytes() == Recorder::KeptBytesBudget, "the real depth-copy linear buffer did not complete the kept-byte budget");
+                Require(recorder.OpenKeptBytes() == Recorder::KeptBytesBudget, "the depth-copy linear buffer and image did not complete the kept-byte budget");
                 Require(!pool->Take(bytes, usage, properties) && !mock.destroyedImages.contains(depths.back()), "a recorded depth transfer released its linear buffer or destination before its fence");
                 recorder.BoundKeptBytes();
                 Require(recorder.Submissions() == batch + 1 && !recorder.Recording(), "the depth-copy charge did not submit a full budget batch");
@@ -8243,6 +8294,333 @@ void sampleOrderTests() {
     const ShaderRecompiler::RequestSerializer serializer;
     const auto back = serializer.Deserialize(serializer.Serialize(request));
     Require(back.request.context.pixel.has_value() && back.request.context.pixel->sampleOrder == rowSwap, "the recompile request lost the pixel shader's sample order");
+}
+
+
+std::unique_ptr<AgcDriver::Graphics::Pipeline> buildOwnerTestPipeline(const AgcDriver::Graphics::Context& context, std::uint32_t identity, VkPrimitiveTopology topology, std::uint8_t writeMask, bool optimize) {
+    using namespace AgcDriver::Graphics;
+    const bool alternate = identity == 402u || identity == 502u;
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.spirv = makeModule({.vertexInput = alternate});
+    fragment.spirv = makeModule({.fragment = true, .secondTarget = alternate});
+    const std::array<CompiledShader, 2> shaders{{
+        {ShaderRecompiler::ShaderStage::Vertex, &vertex, 0},
+        {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}
+    }};
+    State state{};
+    state.topology = topology;
+    state.color = {0x1000u, {4, 4}, VK_FORMAT_R8G8B8A8_UNORM, 64, 0xe4u};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {4, 4};
+    state.blend.colorWriteMask = writeMask;
+    state.blends = {state.blend};
+    PipelineSetLayouts resources{};
+    auto localContext = context;
+    localContext.limits.maxColorAttachments = 1;
+    localContext.pipelineLinkTimeOptimization = optimize;
+    return std::make_unique<Pipeline>(localContext, state, VertexInputLayout{}, resources, shaders);
+}
+
+void setPipelineLibraryCapOne() {
+#ifdef _WIN32
+    _putenv_s("APS5_PIPELINE_LIBRARY_ENTRIES", "1");
+    _putenv_s("APS5_NO_PIPELINE_LTO", "");
+#else
+    setenv("APS5_PIPELINE_LIBRARY_ENTRIES", "1", 1);
+    unsetenv("APS5_NO_PIPELINE_LTO");
+#endif
+}
+
+std::set<VkPipeline> pipelineHandleSnapshot(const std::set<VkPipeline>& source) {
+    std::lock_guard lock(pipelineHandleMutex);
+    return source;
+}
+
+std::set<VkPipeline> pipelineHandleDifference(const std::set<VkPipeline>& left, const std::set<VkPipeline>& right) {
+    std::set<VkPipeline> result;
+    for (const auto handle : left) if (!right.contains(handle)) result.insert(handle);
+    return result;
+}
+
+std::uint32_t pipelineDestroyCount(VkPipeline pipeline) {
+    std::lock_guard lock(pipelineHandleMutex);
+    const auto found = pipelineDestroyCounts.find(pipeline);
+    return found == pipelineDestroyCounts.end() ? 0u : found->second;
+}
+
+void requirePipelinesDestroyedOnce(const std::set<VkPipeline>& handles) {
+    std::unique_lock lock(pipelineHandleMutex);
+    const bool destroyed = pipelineHandleCondition.wait_for(lock, std::chrono::seconds(2), [&] {
+        return std::all_of(handles.begin(), handles.end(), [&](VkPipeline handle) {
+            const auto found = pipelineDestroyCounts.find(handle);
+            return found != pipelineDestroyCounts.end() && found->second == 1u;
+        });
+    });
+    Require(destroyed, "a pipeline library owner did not reach exactly one destruction");
+}
+
+void pipelineLibraryOwnerEvictionTests() {
+    using namespace AgcDriver::Graphics;
+    setPipelineLibraryCapOne();
+    mock = MockVulkan{};
+    {
+        std::lock_guard lock(pipelineHandleMutex);
+        libraryHandles.clear();
+        linkedHandles.clear();
+        optimizedHandles.clear();
+        pipelineDestroyCounts.clear();
+        pipelineDeviceAlive = true;
+        pipelineDestroyAfterDeviceDeath = false;
+    }
+    auto context = mockContext();
+    context.graphicsPipelineLibrary = true;
+    auto first = buildOwnerTestPipeline(context, 401u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 15u, false);
+    const auto firstLibraries = pipelineHandleSnapshot(libraryHandles);
+    const auto afterFirst = PipelineLibraryCountersOf(context.device).built;
+    auto second = buildOwnerTestPipeline(context, 402u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, 7u, false);
+    const auto secondAllLibraries = pipelineHandleSnapshot(libraryHandles);
+    const auto secondLibraries = pipelineHandleDifference(secondAllLibraries, firstLibraries);
+    const auto afterSecond = PipelineLibraryCountersOf(context.device).built;
+    for (std::size_t part = 0; part < 4; ++part) Require(afterSecond[part] == afterFirst[part] + 1u, "the second distinct key did not build one library for every GPL part");
+    for (const auto handle : firstLibraries) Require(pipelineDestroyCount(handle) == 0u, "an evicted library was destroyed while its linked pipeline remained alive");
+    auto third = buildOwnerTestPipeline(context, 401u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 15u, false);
+    const auto thirdAllLibraries = pipelineHandleSnapshot(libraryHandles);
+    const auto thirdLibraries = pipelineHandleDifference(thirdAllLibraries, secondAllLibraries);
+    const auto afterThird = PipelineLibraryCountersOf(context.device).built;
+    const bool rebuiltEveryPart = std::equal(afterThird.begin(), afterThird.end(), afterSecond.begin(), [](std::uint64_t current, std::uint64_t previous) { return current == previous + 1u; });
+    if (!rebuiltEveryPart) {
+        first.reset();
+        second.reset();
+        third.reset();
+        ClearPipelineLibraries(context.device);
+        Require(false, "cap-one A/B/A did not rebuild the evicted library parts");
+    }
+    for (const auto handle : firstLibraries) Require(pipelineDestroyCount(handle) == 0u, "rebuilding A invalidated the original linked pipeline's library owner");
+    first.reset();
+    requirePipelinesDestroyedOnce(firstLibraries);
+    ClearPipelineLibraries(context.device);
+    for (const auto handle : secondLibraries) Require(pipelineDestroyCount(handle) == 0u, "normal cache clear destroyed a library still leased by a linked pipeline");
+    second.reset();
+    third.reset();
+    requirePipelinesDestroyedOnce(secondLibraries);
+    requirePipelinesDestroyedOnce(thirdLibraries);
+    const auto allLibraries = pipelineHandleSnapshot(libraryHandles);
+    for (const auto handle : allLibraries) Require(pipelineDestroyCount(handle) == 1u, "a library handle was destroyed more or less than once");
+    Require(mock.live == 0, "the GPL owner eviction test leaked mock Vulkan objects");
+}
+
+void pipelineLibraryOptimizedClearTests() {
+    using namespace AgcDriver::Graphics;
+    setPipelineLibraryCapOne();
+    mock = MockVulkan{};
+    {
+        std::lock_guard lock(pipelineHandleMutex);
+        libraryHandles.clear();
+        linkedHandles.clear();
+        optimizedHandles.clear();
+        pipelineDestroyCounts.clear();
+        pipelineDeviceAlive = true;
+        pipelineDestroyAfterDeviceDeath = false;
+    }
+    auto context = mockContext();
+    context.graphicsPipelineLibrary = true;
+    auto second = buildOwnerTestPipeline(context, 502u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, 7u, false);
+    const auto secondLibraries = pipelineHandleSnapshot(libraryHandles);
+    {
+        std::lock_guard lock(pipelineCreateMutex);
+        blockOptimizedCreate = true;
+        optimizedCreateEntered = false;
+        releaseOptimizedCreate = false;
+    }
+    auto first = buildOwnerTestPipeline(context, 501u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 15u, true);
+    bool entered = false;
+    {
+        std::unique_lock lock(pipelineCreateMutex);
+        entered = pipelineCreateCondition.wait_for(lock, std::chrono::seconds(2), [] { return optimizedCreateEntered; });
+        if (!entered) releaseOptimizedCreate = true;
+    }
+    pipelineCreateCondition.notify_all();
+    if (!entered) {
+        first.reset();
+        WaitForOptimizedPipelines(context.device);
+        second.reset();
+        ClearPipelineLibraries(context.device);
+        {
+            std::lock_guard lock(pipelineCreateMutex);
+            blockOptimizedCreate = false;
+        }
+        Require(false, "the optimized pipeline job did not enter the blocked Vulkan create");
+    }
+    const auto firstLibraries = pipelineHandleDifference(pipelineHandleSnapshot(libraryHandles), secondLibraries);
+    std::atomic<bool> releaseReturned{false};
+    std::atomic<bool> clearStarted{false};
+    std::atomic<bool> cleared{false};
+    std::thread release([&] {
+        first.reset();
+        releaseReturned.store(true, std::memory_order_release);
+    });
+    std::thread clear([&] {
+        clearStarted.store(true, std::memory_order_release);
+        ClearPipelineLibraries(context.device);
+        cleared.store(true, std::memory_order_release);
+    });
+    const auto waitDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!clearStarted.load(std::memory_order_acquire) || !releaseReturned.load(std::memory_order_acquire)) && std::chrono::steady_clock::now() < waitDeadline) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const bool clearWaited = clearStarted.load(std::memory_order_acquire) && !cleared.load(std::memory_order_acquire);
+    const bool releaseWaited = !releaseReturned.load(std::memory_order_acquire);
+    const bool ownerStayedAlive = std::all_of(firstLibraries.begin(), firstLibraries.end(), [](VkPipeline handle) { return pipelineDestroyCount(handle) == 0u; });
+    {
+        std::lock_guard lock(pipelineCreateMutex);
+        releaseOptimizedCreate = true;
+    }
+    pipelineCreateCondition.notify_all();
+    release.join();
+    clear.join();
+    Require(clearWaited, "pipeline-library clear did not wait for the blocked optimized job");
+    Require(releaseWaited, "pipeline release did not synchronize with the blocked optimized job");
+    Require(!firstLibraries.empty(), "the optimized pipeline did not create an independent evicted owner");
+    Require(ownerStayedAlive, "the blocked relink lost an evicted library lease");
+    WaitForOptimizedPipelines(context.device);
+    requirePipelinesDestroyedOnce(firstLibraries);
+    const auto optimized = pipelineHandleSnapshot(optimizedHandles);
+    Require(!optimized.empty(), "the blocked optimized call returned no pipeline handle");
+    requirePipelinesDestroyedOnce(optimized);
+    for (const auto handle : secondLibraries) Require(pipelineDestroyCount(handle) == 0u, "clear destroyed a library still leased by the second pipeline");
+    second.reset();
+    requirePipelinesDestroyedOnce(secondLibraries);
+    Require(mock.live == 0, "the GPL optimized-clear test leaked mock Vulkan objects");
+    {
+        std::lock_guard lock(pipelineCreateMutex);
+        blockOptimizedCreate = false;
+    }
+}
+
+void pipelineLibraryAbandonTests() {
+    using namespace AgcDriver::Graphics;
+    setPipelineLibraryCapOne();
+    mock = MockVulkan{};
+    {
+        std::lock_guard lock(pipelineHandleMutex);
+        libraryHandles.clear();
+        linkedHandles.clear();
+        optimizedHandles.clear();
+        pipelineDestroyCounts.clear();
+        pipelineDeviceAlive = true;
+        pipelineDestroyAfterDeviceDeath = false;
+    }
+    auto context = mockContext();
+    context.graphicsPipelineLibrary = true;
+    auto stale = buildOwnerTestPipeline(context, 601u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 15u, false);
+    const auto staleLibraries = pipelineHandleSnapshot(libraryHandles);
+    ClearPipelineLibraries(context.device);
+    for (const auto handle : staleLibraries) Require(pipelineDestroyCount(handle) == 0u, "cache clear destroyed an owner still leased by a stale pipeline wrapper");
+    {
+        std::lock_guard lock(pipelineHandleMutex);
+        pipelineDeviceAlive = false;
+    }
+    stale->Abandon();
+    stale.reset();
+    {
+        std::lock_guard lock(pipelineHandleMutex);
+        Require(!pipelineDestroyAfterDeviceDeath, "Pipeline::Abandon invoked a Vulkan callback after device teardown");
+    }
+    for (const auto handle : staleLibraries) Require(pipelineDestroyCount(handle) == 0u, "stale wrapper abandonment destroyed an owner through a dead device");
+
+    mock = MockVulkan{};
+    {
+        std::lock_guard lock(pipelineHandleMutex);
+        libraryHandles.clear();
+        linkedHandles.clear();
+        optimizedHandles.clear();
+        pipelineDestroyCounts.clear();
+        pipelineDeviceAlive = true;
+        pipelineDestroyAfterDeviceDeath = false;
+    }
+    auto liveContext = mockContext();
+    liveContext.graphicsPipelineLibrary = true;
+    auto live = buildOwnerTestPipeline(liveContext, 602u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 15u, false);
+    const auto liveLibraries = pipelineHandleSnapshot(libraryHandles);
+    live.reset();
+    AbandonPipelineLibraries(liveContext.device);
+    requirePipelinesDestroyedOnce(liveLibraries);
+    Require(mock.live == 0, "pre-destroy library abandonment leaked mock Vulkan objects");
+    {
+        std::lock_guard lock(pipelineHandleMutex);
+        pipelineDeviceAlive = false;
+        Require(!pipelineDestroyAfterDeviceDeath, "pre-destroy cleanup invoked Vulkan callbacks after the device was marked dead");
+    }
+}
+
+std::array<std::uint64_t, 3> pipelineDestroyCallbackCounts() {
+    std::lock_guard lock(pipelineHandleMutex);
+    return {pipelineDestroyCallbacks, pipelineLayoutDestroyCallbacks, shaderModuleDestroyCallbacks};
+}
+
+void pipelineLibraryGenerationReuseTests() {
+    using namespace AgcDriver::Graphics;
+    setPipelineLibraryCapOne();
+    mock = MockVulkan{};
+    {
+        std::lock_guard lock(pipelineHandleMutex);
+        libraryHandles.clear();
+        linkedHandles.clear();
+        optimizedHandles.clear();
+        pipelineDestroyCounts.clear();
+        pipelineDestroyCallbacks = 0;
+        pipelineLayoutDestroyCallbacks = 0;
+        shaderModuleDestroyCallbacks = 0;
+        pipelineDeviceAlive = true;
+        pipelineDestroyAfterDeviceDeath = false;
+    }
+    auto context = mockContext();
+    context.graphicsPipelineLibrary = true;
+    auto stale = buildOwnerTestPipeline(context, 701u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 15u, false);
+    const auto firstLibraries = pipelineHandleSnapshot(libraryHandles);
+    const auto firstLinked = pipelineHandleSnapshot(linkedHandles);
+    ClearPipelineLibraries(context.device);
+    for (const auto handle : firstLibraries) Require(pipelineDestroyCount(handle) == 0u, "normal clear released the first generation's leased owner");
+    auto sibling = buildOwnerTestPipeline(context, 702u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 15u, false);
+    const auto allOldLibraries = pipelineHandleSnapshot(libraryHandles);
+    const auto siblingLibraries = pipelineHandleDifference(allOldLibraries, firstLibraries);
+    const auto allOldLinked = pipelineHandleSnapshot(linkedHandles);
+    const auto siblingLinked = pipelineHandleDifference(allOldLinked, firstLinked);
+    Require(!siblingLibraries.empty() && !siblingLinked.empty(), "the sibling pipeline did not create an independent old-domain owner");
+    {
+        std::lock_guard lock(pipelineHandleMutex);
+        pipelineDeviceAlive = false;
+    }
+    const auto beforeStaleAbandon = pipelineDestroyCallbackCounts();
+    stale->Abandon();
+    stale.reset();
+    Require(pipelineDestroyCallbackCounts() == beforeStaleAbandon, "stale A abandonment called Vulkan while its device was dead");
+    {
+        std::lock_guard lock(pipelineHandleMutex);
+        pipelineDeviceAlive = true;
+    }
+    const auto callbacksBeforeCurrentBuild = pipelineDestroyCallbackCounts();
+    auto current = buildOwnerTestPipeline(context, 703u, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 15u, false);
+    const auto callbacksAfterCurrentBuild = pipelineDestroyCallbackCounts();
+    Require(callbacksAfterCurrentBuild[2] > callbacksBeforeCurrentBuild[2], "fresh-generation build did not release its shader modules");
+    const auto currentLibraries = pipelineHandleDifference(pipelineHandleSnapshot(libraryHandles), allOldLibraries);
+    const auto currentLinked = pipelineHandleDifference(pipelineHandleSnapshot(linkedHandles), allOldLinked);
+    Require(!currentLibraries.empty() && !currentLinked.empty(), "the reused VkDevice bits did not establish a fresh library generation");
+    const auto beforeSiblingDestroy = pipelineDestroyCallbackCounts();
+    sibling.reset();
+    Require(pipelineDestroyCallbackCounts() == beforeSiblingDestroy, "the stale sibling invoked old-generation Vulkan callbacks after device-handle reuse");
+    for (const auto handle : siblingLibraries) Require(pipelineDestroyCount(handle) == 0u, "the stale sibling destroyed an old-generation owner after handle reuse");
+    for (const auto handle : siblingLinked) Require(pipelineDestroyCount(handle) == 0u, "the stale sibling destroyed its old linked pipeline after handle reuse");
+    for (const auto handle : currentLibraries) Require(pipelineDestroyCount(handle) == 0u, "old-generation sibling destruction affected a new-generation library");
+    const auto callbacksBeforeCurrentDestroy = pipelineDestroyCallbackCounts();
+    current.reset();
+    ClearPipelineLibraries(context.device);
+    requirePipelinesDestroyedOnce(currentLibraries);
+    for (const auto handle : currentLinked) Require(pipelineDestroyCount(handle) == 1u, "the fresh generation did not destroy its linked pipeline exactly once");
+    const auto callbacksAfterCurrentDestroy = pipelineDestroyCallbackCounts();
+    Require(callbacksAfterCurrentDestroy[0] - callbacksBeforeCurrentDestroy[0] == currentLibraries.size() + currentLinked.size(), "fresh-generation teardown invoked an unexpected pipeline destroy callback count");
+    Require(callbacksAfterCurrentDestroy[1] > callbacksBeforeCurrentDestroy[1], "fresh-generation teardown did not release its pipeline layouts");
+    Require(callbacksAfterCurrentDestroy[2] == callbacksBeforeCurrentDestroy[2], "fresh-generation teardown repeated a shader-module destroy already completed during construction");
 }
 
 void pipelineLibrarySetTests() {
@@ -12389,6 +12767,22 @@ int main(int argc, char** argv) {
         if (argc == 2 && (std::string_view(argv[1]) == "--pipeline-journal" || std::string_view(argv[1]) == "--pipeline-journal-long-paths" || std::string_view(argv[1]) == "--pipeline-journal-extended-paths")) {
             pipelineJournalTests(std::string_view(argv[1]) != "--pipeline-journal", std::string_view(argv[1]) == "--pipeline-journal-extended-paths");
             std::cout << "pipeline journal recipe, record and replay tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-owner-eviction") {
+            pipelineLibraryOwnerEvictionTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-optimized-clear") {
+            pipelineLibraryOptimizedClearTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-abandon") {
+            pipelineLibraryAbandonTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-generation-reuse") {
+            pipelineLibraryGenerationReuseTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-clear-waits-for-build") {

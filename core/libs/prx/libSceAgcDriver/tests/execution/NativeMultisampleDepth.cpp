@@ -1,11 +1,15 @@
+#include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTextureLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -19,17 +23,22 @@
 #include <SDL_loadso.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -45,6 +54,12 @@
 #include <iterator>
 #endif
 #endif
+
+namespace AgcDriver {
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+}
 
 namespace AgcDriver::DriverDetail {
 struct DriverTestAccess {
@@ -283,6 +298,10 @@ void TargetRefuses(Action action, std::string_view expected) {
     Require(message.find(expected) != std::string::npos, "multisample target refusal did not match " + std::string(expected) + ": " + message);
 }
 
+std::string_view PublicationRefusal(VkFormat format) {
+    return format == VK_FORMAT_D16_UNORM ? "guest publication of a written native multisample D16 depth is not implemented" : "guest publication of a written native multisample depth needs the texture detiler";
+}
+
 void QueueTargetByteWrite(const Context& context, Recorder& recorder, std::uint64_t address, std::byte value) {
     auto buffer = std::make_shared<Buffer>(context, 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     const auto commands = recorder.Commands();
@@ -480,7 +499,7 @@ std::vector<std::uint32_t> DepthFragmentShader() {
     return module.Finalize();
 }
 
-std::vector<std::uint32_t> DepthFeedbackFragmentShader(std::uint32_t binding, bool sampling) {
+std::vector<std::uint32_t> DepthFeedbackFragmentShader(std::uint32_t binding, bool sampling, float constantDepth = 0.0f, bool multisampledImage = true, bool constantResult = false) {
     ShaderRecompiler::SpirvModule module;
     module.EmitCapability(spv::CapabilityShader);
     module.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
@@ -489,7 +508,7 @@ std::vector<std::uint32_t> DepthFeedbackFragmentShader(std::uint32_t binding, bo
     const auto v4 = module.Type(spv::OpTypeVector, f32, 4u);
     const auto v2 = module.Type(spv::OpTypeVector, i32, 2u);
     const auto voidType = module.Type(spv::OpTypeVoid);
-    const auto imageType = module.Type(spv::OpTypeImage, f32, spv::Dim2D, 0u, 0u, 1u, 1u, spv::ImageFormatUnknown);
+    const auto imageType = module.Type(spv::OpTypeImage, f32, spv::Dim2D, 0u, 0u, multisampledImage ? 1u : 0u, 1u, spv::ImageFormatUnknown);
     const auto imageArray = module.Type(spv::OpTypeArray, imageType, module.Constant(spv::OpConstant, i32, 1u));
     const auto image = sampling ? module.DefineGlobalVariable(module.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, imageArray), spv::StorageClassUniformConstant) : 0u;
     if (sampling) {
@@ -503,15 +522,16 @@ std::vector<std::uint32_t> DepthFeedbackFragmentShader(std::uint32_t binding, bo
     const auto main = module.AllocateId();
     module.AddFunction(spv::OpFunction, voidType, main, spv::FunctionControlMaskNone, module.Type(spv::OpTypeFunction, voidType));
     module.AddFunction(spv::OpLabel, module.AllocateId());
-    auto value = module.Constant(spv::OpConstant, f32, 0u);
+    auto value = module.Constant(spv::OpConstant, f32, std::bit_cast<std::uint32_t>(constantDepth));
     if (sampling) {
         const auto element = module.AllocateId(), object = module.AllocateId(), fetched = module.AllocateId();
         value = module.AllocateId();
         module.AddFunction(spv::OpAccessChain, module.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, imageType), element, image, zero);
         module.AddFunction(spv::OpLoad, imageType, object, element);
-        module.AddFunction(spv::OpImageFetch, v4, fetched, object, coordinate, spv::ImageOperandsSampleMask, zero);
+        module.AddFunction(spv::OpImageFetch, v4, fetched, object, coordinate, multisampledImage ? spv::ImageOperandsSampleMask : spv::ImageOperandsLodMask, zero);
         module.AddFunction(spv::OpCompositeExtract, f32, value, fetched, 0u);
     }
+    if (constantResult) value = module.Constant(spv::OpConstant, f32, std::bit_cast<std::uint32_t>(constantDepth));
     module.AddFunction(spv::OpStore, depth, value);
     module.AddFunction(spv::OpReturn);
     module.AddFunction(spv::OpFunctionEnd);
@@ -642,6 +662,21 @@ std::array<std::uint32_t, 8> DepthSampleWords(const DepthTarget& target) {
     return {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>((base >> 32u) & 255u) | (format << 20u) | ((width & 3u) << 30u), (width >> 2u) | (height << 14u), (14u << 28u) | (24u << 20u) | (count << 16u) | 0x204u, 0u, count << 4u, (target.iterate256 ? 1u << 10u : 0u) | (1u << 19u) | (1u << 21u) | (static_cast<std::uint32_t>(metadata & 255u) << 24u), static_cast<std::uint32_t>(metadata >> 8u)};
 }
 
+std::array<std::uint32_t, 8> HtileAliasWords(const DepthTarget& target) {
+    constexpr std::uint32_t width = 16u;
+    constexpr std::uint32_t height = 16u;
+    constexpr std::uint32_t format8888Unorm = 56u;
+    constexpr std::uint32_t type2D = 9u;
+    const auto address = target.htileAddress;
+    return {
+        static_cast<std::uint32_t>(address >> 8u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format8888Unorm << 20u) | (((width - 1u) & 3u) << 30u),
+        ((width - 1u) >> 2u) | ((height - 1u) << 14u),
+        0xfacu | (type2D << 28u),
+        0u, 0u, 0u, 0u,
+    };
+}
+
 bool DepthSupported(const Context& context, VkFormat format, std::uint32_t fragments) {
     VkImageFormatProperties properties{};
     const auto result = context.imageFormatProperties(context.physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0u, &properties);
@@ -688,8 +723,7 @@ void CheckDrawFeedback() {
     device->Draw(state, draw, initial);
     device->WaitIdle();
     std::array<std::byte, 1> probe{};
-    TargetRefuses([&] { AgcDriver::GuestMemory::Read(depth.address, probe); }, "sample-preserving guest publication");
-    Require(DepthSurfaceAt(depth.address), "a refused guest read retired a native depth surface a draw wrote");
+    Require(DepthSurfaceAt(depth.address), "a draw left no resident native depth surface");
     reader.spirv = DepthFeedbackFragmentShader(binding, true);
     reader.variantId = 3u;
     const auto words = DepthSampleWords(depth);
@@ -721,7 +755,218 @@ void CheckDrawFeedback() {
     AgcDriver::GuestMemory::Read(tested.address + depthBytes - 1u, probe);
     Require(probe[0] == guestByte(depthBytes - 1u), "a guest read after a depth-test-only draw did not return its guest bytes");
     Require(!DepthSurfaceAt(tested.address), "a guest read left a native depth surface only depth-tested resident");
-    std::puts("Native depth feedback refused through the draw resource path; a written surface refused and a depth-tested one retired on guest read");
+    std::puts("Native depth feedback refused through the draw resource path; a depth-tested surface retired on guest read");
+}
+
+void CheckCustomLocationHtileRead() {
+    const auto device = OpenVulkanTestDevice();
+    Require(device != nullptr, "custom-location HTILE alias requires Vulkan");
+    struct Cleanup {
+        AgcDriver::VulkanDevice& device;
+        ~Cleanup() { device.WaitIdle(); ClearCachedTextures(device.Device()); ClearDepthSurfaces(device.Device()); }
+    } cleanup{*device};
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+    constexpr VkExtent2D extent{5u, 3u};
+    constexpr std::uint32_t samples = 4u;
+    Require(DepthSupported(context, VK_FORMAT_D32_SFLOAT, samples) && (context.sampleLocationSampleCounts & samples) != 0u && SampleLocationsCompatibleDepth(context, VK_FORMAT_D32_SFLOAT, samples), "the regression requires sampleable 4x D32 custom sample locations");
+    const auto depthBytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, 4u, samples));
+    const auto metadataBytes = static_cast<std::size_t>(HtileMetadataBytes(extent));
+    const AgcDriver::Pm4::DrawParameters draw{0u, 3u, 0u, 1u, 0u, false};
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.spirv = DepthVertexShader();
+    vertex.variantId = 101u;
+    constexpr auto binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding;
+    constexpr std::array<std::uint8_t, 4> locations{0x6au, 0xa6u, 0xeeu, 0x22u};
+
+    for (const bool previouslyWritten : {false, true}) {
+        TargetMemory memory(depthBytes), metadata(65536u);
+        const std::uint32_t htile = previouslyWritten ? 0u : 0xfffffff0u;
+        for (std::size_t offset = 0u; offset < metadataBytes; offset += 4u) std::memcpy(metadata.Data() + offset, &htile, sizeof(htile));
+        DepthTarget depth{memory.Address(), 0u, extent, VK_FORMAT_D32_SFLOAT, previouslyWritten ? 0.0f : 1.0f, 0u, metadata.Address(), false, samples};
+        depth.depthSwizzle = 24u;
+        depth.htileDepthOnly = true;
+        depth.iterate256 = depth.htilePipeAligned = true;
+
+        State state{};
+        state.stages = {ShaderPath::Vertex, 0u, 32u, 32u, std::nullopt, std::nullopt};
+        state.depth = depth;
+        state.depthTest = true;
+        state.depthWrite = previouslyWritten;
+        state.depthCompare = VK_COMPARE_OP_ALWAYS;
+        state.renderExtent = extent;
+        state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        state.viewport = {0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0f, 1.0f};
+        state.negativeOneToOne = false;
+        state.scissor = {{0, 0}, extent};
+        state.cullMode = VK_CULL_MODE_NONE;
+        state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        state.samples = samples;
+        state.customSampleLocations = true;
+        for (std::uint32_t pixel = 0u; pixel < 4u; ++pixel) std::copy(locations.begin(), locations.end(), state.sampleLocations.begin() + pixel * 8u);
+
+        if (!previouslyWritten) {
+            Require(DepthSurfaceView(context, depth, false) != VK_NULL_HANDLE && DepthSurfaceAt(depth.address), "the HTILE clear fixture did not create an active guarded depth surface");
+        } else {
+            ShaderRecompiler::RecompileResult producer;
+            producer.spirv = DepthFeedbackFragmentShader(binding, false, 0.375f);
+            producer.variantId = 102u;
+            const std::array<CompiledShader, 2> initial{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0u}, {ShaderRecompiler::ShaderStage::Fragment, &producer, PixelPushOffset(0u, device->Target())}}};
+            device->Draw(state, draw, initial);
+            device->WaitIdle();
+            Require(DepthSurfaceAt(depth.address), "the previously written depth surface lost its native owner");
+            state.depthWrite = false;
+        }
+
+        ShaderRecompiler::RecompileResult reader;
+        reader.spirv = DepthFeedbackFragmentShader(binding, true, 0.0f, false);
+        reader.variantId = previouslyWritten ? 104u : 103u;
+        ShaderRecompiler::DescriptorBinding image{};
+        image.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+        image.role = ShaderRecompiler::DescriptorRole::GuestImages;
+        image.descriptorSet = ShaderRecompiler::RuntimeAbi::DescriptorSet;
+        image.binding = binding;
+        image.count = 1u;
+        const auto htileWords = HtileAliasWords(depth);
+        image.guestDescriptor.assign(htileWords.begin(), htileWords.end());
+        image.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+        image.imageSamplers = {0u};
+        reader.bindings.push_back(std::move(image));
+        const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0u}, {ShaderRecompiler::ShaderStage::Fragment, &reader, PixelPushOffset(0u, device->Target())}}};
+
+        std::shared_ptr<const AgcDriver::DrawRecipe> recipe;
+        device->Draw(state, draw, shaders, {}, &recipe);
+        device->WaitIdle();
+        Require(DepthSurfaceAt(depth.address), "the custom-location draw left no active native depth surface");
+        Require(recipe != nullptr, "the custom-location HTILE draw produced no recipe");
+        std::array<std::byte, 1> recipeProbe{};
+        AgcDriver::GuestMemory::Read(depth.htileAddress, recipeProbe);
+        Require(!DepthSurfaceAt(depth.address), "the recipe probe left the native depth surface active");
+        const auto replayed = device->DrawFromRecipe(state, draw, shaders, {}, recipe);
+        device->WaitIdle();
+        Require(replayed == AgcDriver::RecipeOutcome::Recorded, "the custom-location HTILE draw did not replay its recipe");
+
+        auto words = DepthSampleWords(depth);
+        auto texture = CachedSampledTexture(context, words);
+        Require(texture != nullptr && DepthSurfaceHolds(context, DecodeTextureResource(words), texture.get()), "the custom-location depth output has no native sampled view");
+        const auto count = extent.width * extent.height * samples;
+        Buffer output(context, (count + 2u) * 16u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memset(output.Bytes().data(), 0xa5, output.Bytes().size());
+        const Fetch fetch(context, *texture, output, FetchShader(extent.width, extent.height, samples, false, true));
+        CommandBatch batch(context);
+        fetch.Run(batch.Handle(), count);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        output.Invalidate();
+        const auto expected = previouslyWritten ? 0.375f : 1.0f;
+        for (std::uint32_t index = 0u; index < count; ++index) {
+            std::array<float, 4> value{};
+            std::memcpy(value.data(), output.Bytes().data() + (index + 1u) * 16u, sizeof(value));
+            Require(value == std::array<float, 4>{expected, 0.0f, 0.0f, 1.0f}, "the custom-location sampled-resource draw lost an initial clear or previously written sample");
+        }
+        texture.reset();
+        const auto retainedView = DepthSurfaceView(context, depth, false);
+        std::array<std::byte, 1> probe{};
+        AgcDriver::GuestMemory::Read(depth.htileAddress, probe);
+        Require(!DepthSurfaceAt(depth.address), "reading HTILE did not retire the restored depth owner");
+        Require(DepthSurfaceView(context, depth, false) == retainedView, "rebinding discarded unchanged native depth samples");
+        ShaderRecompiler::RecompileResult writer;
+        writer.spirv = DepthFeedbackFragmentShader(binding, true, 0.625f, false, true);
+        writer.variantId = previouslyWritten ? 106u : 105u;
+        writer.bindings = reader.bindings;
+        state.depthWrite = true;
+        const std::array<CompiledShader, 2> writing{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0u}, {ShaderRecompiler::ShaderStage::Fragment, &writer, PixelPushOffset(0u, device->Target())}}};
+        device->Draw(state, draw, writing);
+        device->WaitIdle();
+        AgcDriver::GuestMemory::Read(depth.address, probe);
+        Require(!DepthSurfaceAt(depth.address), "reading newly written depth did not retire its restored owner");
+        const MultisampleTextureLayout layout(TextureTileMode::kZ64KBX, 4u, samples, extent.width, extent.height, 1u, 0u);
+        for (std::uint32_t y = 0u; y < extent.height; ++y) {
+            for (std::uint32_t x = 0u; x < extent.width; ++x) {
+                for (std::uint32_t sample = 0u; sample < samples; ++sample) {
+                    float value = 0.0f;
+                    std::memcpy(&value, memory.Data() + layout.Offset(x, y, 0u, sample), sizeof(value));
+                    Require(value == 0.625f, "a write after depth restoration was lost on guest publication");
+                }
+            }
+        }
+        const std::array<std::byte, 4> changed{};
+        AgcDriver::GuestMemory::Write(depth.htileAddress, changed, 4u);
+        Require(DepthSurfaceView(context, depth, false) != retainedView, "changed guest metadata restored a stale native depth owner");
+        device->WaitIdle();
+        ClearCachedTextures(device->Device());
+        ClearDepthSurfaces(device->Device());
+        std::printf("Custom-location HTILE alias preserved %s samples, published later writes and refused changed metadata\n", previouslyWritten ? "previously written" : "initially cleared");
+    }
+}
+
+void CheckWrittenPublication(std::uint32_t samples, VkExtent2D extent, bool depthOnly, std::uint32_t pipeBankXor) {
+    const auto device = OpenVulkanTestDevice();
+    Require(device != nullptr, "native depth publication requires Vulkan");
+    const auto depthBytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, 4u, samples));
+    const auto metadataBytes = static_cast<std::size_t>(HtileMetadataBytes(extent));
+    TargetMemory memory(depthBytes), metadata(65536u);
+    std::memset(metadata.Data(), 0, 65536u);
+    const auto guestByte = [](std::size_t offset) { return static_cast<std::byte>(offset * 7u + 3u); };
+    for (std::size_t offset = 0u; offset < depthBytes; ++offset) memory.Data()[offset] = guestByte(offset);
+    DepthTarget depth{memory.Address(), 0u, extent, VK_FORMAT_D32_SFLOAT, 0.0f, 0u, metadata.Address(), false, samples};
+    depth.depthSwizzle = 24u;
+    depth.pipeBankXor = pipeBankXor;
+    depth.htileDepthOnly = depthOnly;
+    depth.iterate256 = depth.htilePipeAligned = true;
+    struct Cleanup {
+        AgcDriver::VulkanDevice& device;
+        ~Cleanup() { device.WaitIdle(); ClearCachedTextures(device.Device()); ClearDepthSurfaces(device.Device()); }
+    } cleanup{*device};
+    State state{};
+    state.stages = {ShaderPath::Vertex, 0u, 32u, 32u, std::nullopt, std::nullopt};
+    state.depth = depth;
+    state.depthTest = state.depthWrite = true;
+    state.depthCompare = VK_COMPARE_OP_ALWAYS;
+    state.renderExtent = extent;
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0f, 1.0f};
+    state.negativeOneToOne = false;
+    state.scissor = {{0, 0}, extent};
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.samples = samples;
+    ShaderRecompiler::RecompileResult vertex, producer;
+    vertex.spirv = DepthVertexShader();
+    vertex.variantId = 1u;
+    constexpr float written = 0.375f;
+    producer.spirv = DepthFeedbackFragmentShader(ShaderRecompiler::RuntimeAbi::FirstImageBinding, false, written);
+    producer.variantId = 2u;
+    const AgcDriver::Pm4::DrawParameters draw{0u, 3u, 0u, 1u, 0u, false};
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0u}, {ShaderRecompiler::ShaderStage::Fragment, &producer, PixelPushOffset(0u, device->Target())}}};
+    device->Draw(state, draw, shaders);
+    device->WaitIdle();
+    Require(DepthSurfaceAt(depth.address), "a draw left no resident native depth surface");
+    std::array<std::byte, 1> probe{};
+    AgcDriver::GuestMemory::Read(depth.address, probe);
+    Require(!DepthSurfaceAt(depth.address), "publishing a written native depth surface left it resident");
+    const MultisampleTextureLayout layout(TextureTileMode::kZ64KBX, 4u, samples, extent.width, extent.height, 1u, pipeBankXor);
+    Require(layout.Bytes() == depthBytes, "published native depth layout differs from its guarded range");
+    std::vector<bool> covered(depthBytes);
+    const auto expected = std::bit_cast<std::uint32_t>(written);
+    for (std::uint32_t y = 0u; y < extent.height; ++y) {
+        for (std::uint32_t x = 0u; x < extent.width; ++x) {
+            for (std::uint32_t sample = 0u; sample < samples; ++sample) {
+                const auto offset = static_cast<std::size_t>(layout.Offset(x, y, 0u, sample));
+                std::uint32_t value = 0u;
+                std::memcpy(&value, memory.Data() + offset, sizeof(value));
+                Require(value == expected, "a published native depth sample lost its drawn value");
+                for (std::size_t byte = 0u; byte < sizeof(value); ++byte) covered[offset + byte] = true;
+            }
+        }
+    }
+    for (std::size_t offset = 0u; offset < depthBytes; ++offset) Require(covered[offset] || memory.Data()[offset] == guestByte(offset), "publishing native depth changed guest bytes outside its samples");
+    const std::uint32_t htile = depthOnly ? 0xfffc000fu : 0xfffff00fu;
+    for (std::size_t offset = 0u; offset < metadataBytes; offset += 4u) {
+        std::uint32_t word = 0u;
+        std::memcpy(&word, metadata.Data() + offset, sizeof(word));
+        Require(word == htile, "publishing native depth did not expand its HTILE");
+    }
+    std::printf("Native depth publication samples=%u extent=%ux%u depthOnly=%u xor=0x%x: samples, HTILE and padding checked\n", samples, extent.width, extent.height, depthOnly, pipeBankXor);
 }
 
 void CheckDepthAttachmentAlias() {
@@ -880,8 +1125,8 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     Require(DepthSurfaceView(context, target) == view, "native depth attachment did not reuse its image");
     NoteDepthSurfaceWrite(context, target);
     std::array<std::byte, 1> beforeSampling{};
-    TargetRefuses([&] { AgcDriver::GuestMemory::Read(target.address + bytes - 1u, beforeSampling); }, "sample-preserving guest publication");
-    TargetRefuses([&] { RequireNoMultisampleTarget(target.htileAddress + metadataBytes - 1u, 1u, "a DMA copy"); }, "sample-preserving guest publication");
+    TargetRefuses([&] { AgcDriver::GuestMemory::Read(target.address + bytes - 1u, beforeSampling); }, PublicationRefusal(format));
+    TargetRefuses([&] { RequireNoMultisampleTarget(target.htileAddress + metadataBytes - 1u, 1u, "a DMA copy"); }, PublicationRefusal(format));
     const auto words = DepthSampleWords(target);
     auto texture = CachedSampledTexture(context, words);
     auto arrayTexture = CachedSampledTexture(context, words, VK_IMAGE_VIEW_TYPE_2D_ARRAY);
@@ -1046,19 +1291,19 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     Require(std::all_of(memory.Data(), memory.Data() + bytes, [](auto value) { return value == std::byte{0xa5}; }), "native depth sampling silently published guest memory");
     std::array<std::byte, 1> probe{};
     for (const auto address : {target.address, target.address + bytes - 1u, target.htileAddress, target.htileAddress + metadataBytes - 1u}) {
-        TargetRefuses([&] { RequireNoResidentDepthRead_nid_no_patch(address, 1u); }, "sample-preserving guest publication");
-        TargetRefuses([&] { AgcDriver::GuestMemory::Read(address, probe); }, "sample-preserving guest publication");
-        TargetRefuses([&] { RequireNoMultisampleTarget(address, 1u, "a DMA copy"); }, "sample-preserving guest publication");
+        TargetRefuses([&] { RequireNoResidentDepthRead_nid_no_patch(address, 1u); }, PublicationRefusal(format));
+        TargetRefuses([&] { AgcDriver::GuestMemory::Read(address, probe); }, PublicationRefusal(format));
+        TargetRefuses([&] { RequireNoMultisampleTarget(address, 1u, "a DMA copy"); }, PublicationRefusal(format));
     }
     TargetMemory unrelated(65536u);
     AgcDriver::GuestMemory::Read(unrelated.Address(), probe);
     Require(probe[0] == std::byte{0xa5}, "resident depth guard blocked an unrelated read");
     auto alias = target;
     alias.htileAddress += 65536u;
-    TargetRefuses([&] { DepthSurfaceView(context, alias); }, "sample-preserving guest publication");
+    TargetRefuses([&] { DepthSurfaceView(context, alias); }, PublicationRefusal(format));
     alias = target;
     alias.htileDepthOnly = !target.htileDepthOnly;
-    TargetRefuses([&] { DepthSurfaceView(context, alias); }, "sample-preserving guest publication");
+    TargetRefuses([&] { DepthSurfaceView(context, alias); }, PublicationRefusal(format));
     auto resource = DecodeTextureResource(words);
     for (std::uint32_t field = 0u; field < 18u; ++field) {
         auto changed = resource;
@@ -1133,16 +1378,336 @@ void CheckUnwrittenGuestAccess(Context context, VkFormat format, std::uint32_t f
         RequireNoResidentDepthRead_nid_no_patch(target.htileAddress, metadataBytes);
         recorder.Sync();
         const auto rebound = DepthSurfaceView(context, target);
-        Require(rebound != VK_NULL_HANDLE && rebound != view && resident(), "rebinding after a guest access did not import a new native depth surface");
+        Require(rebound != VK_NULL_HANDLE && resident(), "rebinding after a guest access did not restore a native depth surface");
         view = rebound;
     }
     NoteDepthSurfaceWrite(context, target);
-    TargetRefuses([&] { AgcDriver::GuestMemory::Read(target.address, probe); }, "sample-preserving guest publication");
-    TargetRefuses([&] { RequireNoMultisampleTarget(target.htileAddress, 1u, "a DMA copy"); }, "sample-preserving guest publication");
+    TargetRefuses([&] { AgcDriver::GuestMemory::Read(target.address, probe); }, PublicationRefusal(format));
+    TargetRefuses([&] { RequireNoMultisampleTarget(target.htileAddress, 1u, "a DMA copy"); }, PublicationRefusal(format));
     Require(resident(), "a refused guest access retired a written native depth surface");
     for (std::size_t offset = 0u; offset < bytes; ++offset) Require(memory.Data()[offset] == guestByte(offset), "retiring an unwritten native depth surface changed its guest bytes");
     Require(std::all_of(metadata.Data(), metadata.Data() + metadataBytes, [](std::byte value) { return value == std::byte{0}; }), "retiring an unwritten native depth surface changed its HTILE");
     std::printf("Native depth format=%u samples=%u: guest access retired the unwritten surface and refused the written one\n", static_cast<std::uint32_t>(format), fragments);
+}
+
+PFN_vkGetDeviceProcAddr reclaimDeviceProc = nullptr;
+std::atomic<std::uint64_t> reclaimFreedMemory{0};
+
+VKAPI_ATTR void VKAPI_CALL countReclaimFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* allocator) {
+    if (memory != VK_NULL_HANDLE) ++reclaimFreedMemory;
+    reinterpret_cast<PFN_vkFreeMemory>(reclaimDeviceProc(device, "vkFreeMemory"))(device, memory, allocator);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL reclaimDeviceResolver(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkFreeMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&countReclaimFreeMemory);
+    return reclaimDeviceProc(device, name);
+}
+
+void CheckIdleRetiredReclaim(bool recorderSync = false) {
+    const auto device = OpenVulkanTestDevice();
+    Require(device != nullptr, "native depth idle reclaim requires Vulkan");
+    auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+    context.bufferPool.reset();
+    reclaimDeviceProc = context.deviceProc;
+    reclaimFreedMemory = 0;
+    context.deviceProc = &reclaimDeviceResolver;
+    constexpr VkExtent2D extent{5u, 3u};
+    constexpr std::uint32_t samples = 4u;
+    Require(DepthSupported(context, VK_FORMAT_D32_SFLOAT, samples), "idle reclaim requires sampled four-sample D32");
+    const auto bytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, 4u, samples));
+    const auto metadataBytes = static_cast<std::size_t>(HtileMetadataBytes(extent));
+    TargetMemory depthA(bytes), depthB(bytes), depthC(bytes);
+    TargetMemory htileA(65536u), htileB(65536u), htileC(65536u);
+    struct Cleanup {
+        AgcDriver::VulkanDevice& device;
+        ~Cleanup() { device.WaitIdle(); ClearCachedTextures(device.Device()); ClearDepthSurfaces(device.Device()); }
+    } cleanup{*device};
+    for (auto* metadata : {&htileA, &htileB, &htileC}) std::memset(metadata->Data(), 0, metadataBytes);
+    const auto makeTarget = [&](TargetMemory& depth, TargetMemory& htile) {
+        DepthTarget target{depth.Address(), 0u, extent, VK_FORMAT_D32_SFLOAT, 0.0f, 0u, htile.Address(), false, samples};
+        target.depthSwizzle = 24u;
+        target.iterate256 = target.htilePipeAligned = target.htileDepthOnly = true;
+        return target;
+    };
+    auto active = makeTarget(depthA, htileA);
+    auto rebindable = makeTarget(depthB, htileB);
+    auto retired = makeTarget(depthC, htileC);
+    const auto activeView = DepthSurfaceView(context, active, false);
+    auto activePin = DepthSurfaceOrderTarget(context, active).keep;
+    const auto rebindView = DepthSurfaceView(context, rebindable, false);
+    auto rebindPin = DepthSurfaceOrderTarget(context, rebindable).keep;
+    Require(DepthSurfaceView(context, retired, false) != VK_NULL_HANDLE, "retired reclaim fixture has no depth attachment");
+    auto pin = DepthSurfaceOrderTarget(context, retired).keep;
+    std::weak_ptr<void> activeWeak = activePin, rebindWeak = rebindPin, retiredWeak = pin;
+    activePin.reset();
+    rebindPin.reset();
+    const auto words = DepthSampleWords(retired);
+    auto texture = DepthSurfaceTexture(context, words, DecodeTextureResource(words), VkComponentMapping{});
+    Require(texture != nullptr, "retired reclaim fixture has no sampled view");
+    RetireDepthSurfaces(context.device, active.address, bytes);
+    RequireNoResidentDepthRead_nid_no_patch(rebindable.htileAddress, metadataBytes);
+    RequireNoResidentDepthRead_nid_no_patch(retired.htileAddress, metadataBytes);
+    RetireDepthSurfaces(context.device, retired.address, bytes);
+    const auto sync = [&] {
+        if (recorderSync) {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            context.recorder->Sync();
+        } else device->WaitIdle();
+    };
+    sync();
+    const auto released = DepthSurfacesReleased();
+    Require(!retiredWeak.expired(), "a CPU-pinned retired depth surface was reclaimed");
+    pin.reset();
+    sync();
+    Require(!retiredWeak.expired(), "a retired depth surface with a sampled view was reclaimed");
+    texture.reset();
+    const auto freed = reclaimFreedMemory.load();
+    bool nestedCompletion = false;
+    bool aliveDuringNestedSync = false;
+    if (recorderSync) {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        context.recorder->Commands();
+        context.recorder->OnComplete([&] {
+            context.recorder->Sync();
+            nestedCompletion = true;
+            aliveDuringNestedSync = !retiredWeak.expired();
+        });
+        context.recorder->Sync();
+    } else sync();
+    if (recorderSync) Require(nestedCompletion && aliveDuringNestedSync, "a nested recorder sync reclaimed a depth surface while an outer batch was finishing");
+    Require(retiredWeak.expired(), "an unpinned idle retired depth surface was not reclaimed");
+    Require(DepthSurfacesReleased() == released + 1u, "reclaim did not invalidate the depth framebuffer generation");
+    Require(reclaimFreedMemory.load() > freed, "reclaim did not free native depth Vulkan memory");
+    Require(!activeWeak.expired() && !rebindWeak.expired(), "reclaim removed an active or rebindable depth surface");
+    Require(DepthSurfaceView(context, active, false) == activeView, "reclaim changed an active retired depth binding");
+    Require(DepthSurfaceView(context, rebindable, false) == rebindView, "reclaim changed a rebindable depth binding");
+    Require(!DepthSurfaceAt(retired.address), "reclaim exposed a retired depth surface");
+}
+
+void WaitForPresentTrace(std::size_t expected = 1u) {
+    const auto* path = std::getenv("APS5_CAPTURE_TRACE_PATH");
+    if (std::getenv("APS5_CAPTURE_TRACE") == nullptr || path == nullptr || *path == '\0') return;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+        std::ifstream input(path);
+        const std::string trace{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        std::size_t count = 0;
+        for (auto position = trace.find(" present dump="); position != std::string::npos; position = trace.find(" present dump=", position + 1u)) if (++count >= expected) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    } while (std::chrono::steady_clock::now() < deadline);
+    Require(false, "present capture trace did not flush before the deadline");
+}
+
+bool CheckPresentBorrowRefresh() {
+    const auto device = OpenVulkanTestDevice();
+    Require(device != nullptr, "present alias fixture requires Vulkan");
+    auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+    Require(context.recorder != nullptr && context.detiler != nullptr, "present alias fixture requires recorder and detiler");
+    constexpr std::uint32_t side = 128u;
+    constexpr std::size_t sliceBytes = 65536u;
+    constexpr std::size_t bytes = 2u * sliceBytes;
+    constexpr std::size_t importBytes = 0x100000u;
+    TargetMemory memory(importBytes, true);
+    struct Cleanup {
+        AgcDriver::VulkanDevice& device;
+        ~Cleanup() { device.WaitIdle(); ClearCachedTextures(device.Device()); }
+    } cleanup{*device};
+    std::memset(memory.Data(), 0, bytes);
+    std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex());
+    if (HostImportFor(context, memory.Address(), importBytes) == nullptr) {
+        std::puts("skipped, present alias fixture needs a host import");
+        return false;
+    }
+    if (!AgcDriver::GuestMemory::Watched(memory.Address(), bytes)) {
+        std::puts("skipped, present alias fixture needs write-watched guest memory after import");
+        return false;
+    }
+    if (AgcDriver::GuestMemory::CollectWritesUncached(memory.Address(), bytes) == 0) {
+        std::puts("skipped, present alias fixture needs tracked guest generations");
+        return false;
+    }
+    GuestTextureResource first{};
+    first.baseAddress = memory.Address();
+    first.width = first.height = side;
+    first.depthOrLastArray = 1u;
+    first.mipCount = 1u;
+    first.tileMode = TextureTileMode::kR64KBX;
+    first.dimension = TextureDimension::k2DArray;
+    first.format = 56u;
+    first.dstSelX = 4u; first.dstSelY = 5u; first.dstSelZ = 6u; first.dstSelW = 7u;
+    auto second = first;
+    second.format = 60u;
+    const auto geometry = DescribeSurface(first);
+    Require(geometry.guestBytes == bytes && geometry.layerBytes == sliceBytes && geometry.imageLayers == 2u, "present alias fixture does not have two tracked 64 KiB layers");
+    auto a = CachedStorageLayers(context, first, 1u, 1u);
+    auto b = CachedStorageLayers(context, second, 0u, 1u);
+    Require(a != nullptr && b != nullptr && a != b && a->Cached() && b->Cached(), "present alias fixture did not prewarm two cache entries");
+    const auto readPixel = [&](const std::shared_ptr<StorageTexture>& image, std::uint32_t layer) {
+        Buffer output(context, 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = context.recorder->Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, layer, 1u};
+        copy.imageExtent = {1u, 1u, 1u};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, output.Handle(), 1u, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        context.recorder->Sync();
+        output.Invalidate();
+        std::array<std::uint8_t, 4> pixel{};
+        std::memcpy(pixel.data(), output.Bytes().data(), pixel.size());
+        return pixel;
+    };
+    const auto clear = [&](const std::shared_ptr<StorageTexture>& image, std::uint32_t layer, const VkClearColorValue& value) {
+        const auto commands = context.recorder->Commands();
+        context.recorder->Keep(image);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, layer, 1u};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1u, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        image->MarkSliceDirty(layer);
+    };
+    const VkClearColorValue red{{1.0f, 0.0f, 0.0f, 1.0f}};
+    VkClearColorValue green{};
+    green.uint32[0] = 0u; green.uint32[1] = 255u; green.uint32[2] = 0u; green.uint32[3] = 255u;
+    clear(a, 1u, red);
+    Require(CachedStorageLayers(context, second, 0u, 1u) == b, "present alias fixture replaced the prewarmed second image");
+    Require(readPixel(b, 1u) == std::array<std::uint8_t, 4>{255u, 0u, 0u, 255u}, "present alias fixture did not borrow the pending first image layer");
+    clear(b, 0u, green);
+    Require(StorageTexture::FindPendingSlice(memory.Address(), sliceBytes) == a, "present alias fixture did not select the older pending image");
+    Require(PendingStorageOverlaps(memory.Address(), sliceBytes, a.get()), "present alias fixture has no foreign pending image");
+    Require(AgcDriver::GuestMemory::UnchangedSince(memory.Address(), sliceBytes, a->GenerationFor(memory.Address(), sliceBytes)), "present alias fixture guest memory changed");
+    Require(readPixel(a, 0u) == std::array<std::uint8_t, 4>{0u, 0u, 0u, 0u}, "the older image's first layer was not initially stale");
+    const AgcDriver::DisplayBuffer display{memory.Address(), 0x8000000022000000ull, side, side};
+    Require(AgcDriver::DisplayBufferSize(display) == sliceBytes, "present alias fixture display extent differs from its first layer");
+    std::string refusal;
+    try { device->PresentDisplayBuffer(display); }
+    catch (const std::exception& error) { refusal = error.what(); }
+    Require(refusal == "Vulkan presentation: device has no swapchain", "present alias fixture did not reach the headless presentation: " + refusal);
+    Require(readPixel(a, 0u) == std::array<std::uint8_t, 4>{0u, 255u, 0u, 255u}, "present selected stale first-layer pixels over a newer pending alias");
+    Require(readPixel(a, 1u) == std::array<std::uint8_t, 4>{255u, 0u, 0u, 255u}, "present refresh lost the older image's independently pending second layer");
+    {
+        TargetMemory control(importBytes, true);
+        std::memset(control.Data(), 0, bytes);
+        Require(HostImportFor(context, control.Address(), importBytes) != nullptr && AgcDriver::GuestMemory::Watched(control.Address(), bytes), "control needs a watched host import");
+        auto surface = first;
+        surface.baseAddress = control.Address();
+        auto image = CachedStorageLayers(context, surface, 0u, 1u);
+        clear(image, 0u, red);
+        const AgcDriver::DisplayBuffer alone{control.Address(), 0x8000000022000000ull, side, side};
+        Require(StorageTexture::FindPendingSlice(control.Address(), sliceBytes) == image && !PendingStorageOverlaps(control.Address(), sliceBytes, image.get()), "control present has a foreign pending image");
+        Require(AgcDriver::GuestMemory::UnchangedSince(control.Address(), sliceBytes, image->GenerationFor(control.Address(), sliceBytes)), "control present guest memory changed");
+        std::string controlRefusal;
+        try { device->PresentDisplayBuffer(alone); }
+        catch (const std::exception& error) { controlRefusal = error.what(); }
+        Require(controlRefusal == "Vulkan presentation: device has no swapchain", "control did not reach headless presentation: " + controlRefusal);
+        Require(readPixel(image, 0u) == std::array<std::uint8_t, 4>{255u, 0u, 0u, 255u}, "control present changed its resident pixels");
+        device->WaitIdle();
+        ClearCachedTextures(device->Device());
+    }
+    WaitForPresentTrace(2u);
+    return true;
+}
+
+bool CheckPresentCopiedWriter() {
+    const auto device = OpenVulkanTestDevice();
+    Require(device != nullptr, "copied present fixture requires Vulkan");
+    auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+    Require(context.recorder != nullptr && context.detiler != nullptr, "copied present fixture requires recorder and detiler");
+    constexpr std::uint32_t side = 128u;
+    constexpr std::size_t sliceBytes = 65536u;
+    constexpr std::size_t bytes = 2u * sliceBytes;
+    constexpr std::size_t recordOffset = 0x1004u;
+    constexpr std::size_t writtenOffset = recordOffset + 8u;
+    constexpr std::size_t importBytes = 1024u * 1024u;
+    TargetMemory memory(importBytes, true);
+    struct Cleanup {
+        AgcDriver::VulkanDevice& device;
+        ~Cleanup() { device.WaitIdle(); ClearCachedTextures(device.Device()); }
+    } cleanup{*device};
+    std::memset(memory.Data(), 0, bytes);
+    std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex());
+    if (HostImportFor(context, memory.Address(), importBytes) == nullptr || !AgcDriver::GuestMemory::Watched(memory.Address(), bytes) || context.limits.minStorageBufferOffsetAlignment <= 4u) {
+        std::puts("skipped, copied present fixture requires watched host imports and storage alignment above 4");
+        return false;
+    }
+    GuestTextureResource resource{};
+    resource.baseAddress = memory.Address();
+    resource.width = resource.height = side;
+    resource.depthOrLastArray = 1u;
+    resource.mipCount = 1u;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2DArray;
+    resource.format = 56u;
+    resource.dstSelX = 4u; resource.dstSelY = 5u; resource.dstSelZ = 6u; resource.dstSelW = 7u;
+    const auto geometry = DescribeSurface(resource);
+    Require(geometry.guestBytes == bytes && geometry.layerBytes == sliceBytes && geometry.imageLayers == 2u, "copied present fixture requires two 64 KiB layers");
+    auto image = CachedStorageLayers(context, resource, 1u, 1u);
+    Require(image != nullptr, "copied present fixture has no resident image");
+    const auto commands = context.recorder->Commands();
+    context.recorder->Keep(image);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    const VkClearColorValue red{{1.0f, 0.0f, 0.0f, 1.0f}};
+    const VkImageSubresourceRange second{VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 1u, 1u};
+    context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &red, 1u, &second);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    image->MarkSliceDirty(1u);
+    context.recorder->Sync();
+    Require(Recorder::PendingWriteBackCompletions() == 0u, "copied present fixture started with a pending writeback");
+    const AgcDriver::DisplayBuffer display{memory.Address(), 0x8000000022000000ull, side, side};
+    Require(AgcDriver::DisplayBufferSize(display) == sliceBytes, "copied present fixture display size differs from its layer");
+    std::uint32_t pixelX = side, pixelY = side;
+    for (std::uint32_t y = 0; y < side; ++y) for (std::uint32_t x = 0; x < side; ++x) {
+        if (AgcDriver::DisplayBufferOffset(display, x, y) == writtenOffset) { pixelX = x; pixelY = y; }
+    }
+    Require(pixelX < side && pixelY < side, "copied present fixture cannot map the written byte to a display texel");
+    Require(StorageTexture::FindPendingSlice(memory.Address(), sliceBytes) == image, "copied present fixture has no pending resident array");
+    Require(AgcDriver::GuestMemory::UnchangedSince(memory.Address(), sliceBytes, image->GenerationFor(memory.Address(), sliceBytes)), "copied present fixture source was already stale");
+    alignas(256) constexpr std::array<std::uint32_t, 6> code{0x7e000281u, 0x7e020288u, 0xe0701000u, 0x80000001u, 0xbf810000u, 0xbf810000u};
+    const auto record = memory.Address() + recordOffset;
+    std::vector<std::uint32_t> userData(16, 0u);
+    const std::array<std::uint32_t, 4> descriptor{static_cast<std::uint32_t>(record), static_cast<std::uint32_t>((record >> 32u) & 0xffffu), 16u, 0x31016facu};
+    std::copy(descriptor.begin(), descriptor.end(), userData.begin());
+    const std::span<const std::uint32_t> instructions(code);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> shaderMemory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(instructions)}}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{32u, 1u, 1u}, 0, {false, false, false}, false, 1};
+    ShaderRecompiler::RecompileRequest request{{ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), instructions, 0, {}}, {32, 0, userData, compute, std::nullopt, std::nullopt, shaderMemory}, device->Target(), {0, 0, 0, 128}};
+    request.useCache = false;
+    const auto program = ShaderRecompiler::Recompile(request);
+    device->Dispatch(program, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+    if (Recorder::PendingWriteBackCompletions() == 0u) {
+        std::puts("skipped, dispatch did not leave a copied-buffer writeback completion");
+        return false;
+    }
+    Require(Recorder::PendingWriteBackCompletions() == 1u, "copied present fixture has an unexpected number of pending writebacks");
+    Require(StorageTexture::FindPendingSlice(memory.Address(), sliceBytes) == image, "copied dispatch removed the intended pending resident image");
+    Require(Recorder::PendingWriteBackCompletions() == 1u, "copied writer completed before presentation");
+    Require(context.recorder->PendingWriteOverlaps(record, 16u), "copied writer has no pending write note for its buffer");
+    Require(!PendingStorageOverlaps(memory.Address(), sliceBytes, image.get()), "copied writer fixture has a foreign pending storage image");
+    Require(AgcDriver::GuestMemory::UnchangedSince(memory.Address(), sliceBytes, image->GenerationFor(memory.Address(), sliceBytes)), "copied writer fixture already invalidated the resident generation");
+    Require(AgcDriver::GuestMemory::GpuMutex().DepthOnThisThread() == 1u, "copied present fixture requires an outermost GPU hold");
+    std::string refusal;
+    try { device->PresentDisplayBuffer(display); } catch (const std::exception& error) { refusal = error.what(); }
+    Require(refusal == "Vulkan presentation: device has no swapchain", "copied present fixture did not reach headless presentation: " + refusal);
+    const auto readPixel = [&](std::uint32_t layer, std::uint32_t x, std::uint32_t y) {
+        Buffer output(context, 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto read = context.recorder->Commands();
+        RecordMemoryBarrier(context, read, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, layer, 1u};
+        copy.imageOffset = {static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), 0};
+        copy.imageExtent = {1u, 1u, 1u};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(read, image->Image(), VK_IMAGE_LAYOUT_GENERAL, output.Handle(), 1u, &copy);
+        RecordMemoryBarrier(context, read, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        context.recorder->Sync();
+        output.Invalidate();
+        std::array<std::uint8_t, 4> pixel{};
+        std::memcpy(pixel.data(), output.Bytes().data(), pixel.size());
+        return pixel;
+    };
+    Require(readPixel(0u, pixelX, pixelY) == std::array<std::uint8_t, 4>{1u, 0u, 0u, 0u}, "present missed the copied writer's layer 0 pixel");
+    Require(readPixel(1u, 0u, 0u) == std::array<std::uint8_t, 4>{255u, 0u, 0u, 255u}, "present lost the independently pending layer 1 pixel");
+    WaitForPresentTrace();
+    return true;
 }
 
 void CheckHtileRouting(Context context, VkFormat format, std::uint32_t fragments) {
@@ -1343,7 +1908,7 @@ void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, st
     Require(MultisampleTargetView(context, color) != VK_NULL_HANDLE, "retirement fixture has no color attachment");
     recorder.Sync();
     const auto guarded = [&] {
-        TargetRefuses([&] { RequireNoResidentDepthRead_nid_no_patch(target.address, 1u); }, "sample-preserving");
+        TargetRefuses([&] { RequireNoResidentDepthRead_nid_no_patch(target.address, 1u); }, PublicationRefusal(format));
     };
     {
         GuestAllocations::Mutation mutation;
@@ -1426,6 +1991,24 @@ int main(int argc, char** argv) {
 #ifdef __linux__
         const SharedBackingScope sharedBacking;
 #endif
+        if (argc == 2 && std::string_view(argv[1]) == "--sync-retired-reclaim") {
+            CheckIdleRetiredReclaim(true);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--present-copied-writer") {
+            return CheckPresentCopiedWriter() ? 0 : VulkanTestSkipped;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--present-borrow-refresh") {
+            return CheckPresentBorrowRefresh() ? 0 : VulkanTestSkipped;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--idle-retired-reclaim") {
+            CheckIdleRetiredReclaim();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--custom-location-htile-read") {
+            CheckCustomLocationHtileRead();
+            return 0;
+        }
         std::unique_ptr<Device> device;
         try { device = std::make_unique<Device>(); }
         catch (const std::exception& error) {
@@ -1435,8 +2018,15 @@ int main(int argc, char** argv) {
         }
         CheckDrawFeedback();
         const auto context = device->GetContext();
-        if (argc == 1) CheckDepthAttachmentAlias();
-        if (argc == 1) CheckStorageAliasRetirement();
+        if (argc == 1) {
+            CheckDepthAttachmentAlias();
+            for (const auto samples : {2u, 4u, 8u}) {
+                if (!DepthSupported(context, VK_FORMAT_D32_SFLOAT, samples)) continue;
+                CheckWrittenPublication(samples, {5u, 3u}, false, 0u);
+                CheckWrittenPublication(samples, {70u, 67u}, true, 0x8c00u);
+            }
+            CheckStorageAliasRetirement();
+        }
         std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex());
         Require(DepthSupported(context, VK_FORMAT_D32_SFLOAT, 4u), "the native depth regression requires sampled D32 with four samples");
         if (argc == 2 && std::string_view(argv[1]) == "--clear-refusals") {

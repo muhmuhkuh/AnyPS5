@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <string>
 
 namespace AgcDriver::Graphics {
 
@@ -93,9 +94,16 @@ struct GuestTextureResource {
     std::uint64_t fmaskCmaskAddress = 0;
 };
 
+struct TextureDecodeResult {
+    GuestTextureResource resource{};
+    std::string error;
+    explicit operator bool() const noexcept { return error.empty(); }
+};
+
 float EffectiveMinLod(const GuestTextureResource& resource);
 
 bool IsNullTextureResource(std::span<const std::uint32_t> words);
+TextureDecodeResult TryDecodeTextureResource(std::span<const std::uint32_t> words);
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words);
 std::array<std::uint32_t, 8> EncodeTextureResource(const GuestTextureResource& resource);
 bool DescriptorSingleLevel(std::span<const std::uint32_t> words);

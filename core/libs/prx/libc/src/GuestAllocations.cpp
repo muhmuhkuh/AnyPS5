@@ -434,6 +434,8 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         registry().readableLease.reset();
         registry().allLease.reset();
         bool pinned = false;
+        std::uintptr_t pinnedAddress = address;
+        std::size_t pinnedBytes = bytes;
         auto it = ranges.upper_bound(address);
         if (it != ranges.begin()) --it;
         for (; it != ranges.end(); ++it) {
@@ -441,6 +443,10 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
             if (base >= end && base != address) break;
             if (((address < base + range->bytes && base < end) || base == address) && range.use_count() != 1) {
                 pinned = true;
+                if (range->bytes != 0) {
+                    pinnedAddress = base;
+                    pinnedBytes = range->bytes;
+                }
                 break;
             }
         }
@@ -454,7 +460,7 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         if (state != nullptr && state->lock.owns_lock()) {
             state->lock.unlock();
             try {
-                if (waiter != nullptr) progressed = waiter(address, bytes);
+                if (waiter != nullptr) progressed = waiter(pinnedAddress, pinnedBytes);
                 else std::this_thread::yield();
             } catch (...) {
                 state->lock.lock();
