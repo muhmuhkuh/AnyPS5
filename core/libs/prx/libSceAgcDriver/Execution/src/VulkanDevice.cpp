@@ -206,6 +206,7 @@ using ResourceCache = Graphics::ResourceCache;
 
 std::uint32_t DumpScale();
 void WriteFrameBmp(int index, std::uint32_t width, std::uint32_t height, std::span<const std::byte> pixels);
+void WriteSourceBmp(int index, std::uint32_t width, std::uint32_t height, std::span<const std::byte> pixels);
 FrameDumpOutput frameDumpOutput;
 
 class FrameDumpWriter {
@@ -219,7 +220,7 @@ public:
         if (worker.joinable()) worker.join();
     }
 
-    void Enqueue(int index, std::uint32_t width, std::uint32_t height, bool screenshot, std::vector<std::byte> pixels) {
+    void Enqueue(int index, std::uint32_t width, std::uint32_t height, bool screenshot, std::vector<std::byte> pixels, bool source = false) {
         std::unique_lock lock(mutex);
         require(!stopping, "frame dump writer has stopped");
         if (!screenshot && !frameDumpOutput.Enabled_nid_no_patch()) return;
@@ -228,7 +229,7 @@ public:
         require(!stopping, "frame dump writer has stopped");
         if (!worker.joinable()) worker = std::thread([this] { run(); });
         const auto bytes = pixels.size();
-        pending.push_back({index, width, height, screenshot, std::move(pixels)});
+        pending.push_back({index, width, height, screenshot, source, std::move(pixels)});
         queuedBytes += bytes;
         changed.notify_all();
     }
@@ -244,6 +245,7 @@ private:
         std::uint32_t width;
         std::uint32_t height;
         bool screenshot;
+        bool source;
         std::vector<std::byte> pixels;
     };
 
@@ -259,6 +261,7 @@ private:
                 }
                 for (const auto& frame : batch) {
                     if (frame.screenshot) std::fprintf(stderr, "[gpu] screenshot saved: %s\n", Screenshot::Write(GetAppTitleId_nid_postfix().value, frame.width, frame.height, frame.pixels).string().c_str());
+                    else if (frame.source) WriteSourceBmp(frame.index, frame.width, frame.height, frame.pixels);
                     else WriteFrameBmp(frame.index, frame.width, frame.height, frame.pixels);
                     std::lock_guard lock(mutex);
                     queuedBytes -= frame.pixels.size();
@@ -771,13 +774,22 @@ struct VulkanDevice::State {
                     for (std::size_t i = 0; i < sourceBytes; i += 4) {
                         if (bytes[i] != std::byte{} || bytes[i + 1] != std::byte{} || bytes[i + 2] != std::byte{}) ++nonzero;
                     }
+                    std::vector<std::byte> pixels(bytes.begin(), bytes.begin() + sourceBytes);
+                    if (slot.sourceFormat == VK_FORMAT_R8G8B8A8_UNORM || slot.sourceFormat == VK_FORMAT_R8G8B8A8_SRGB) {
+                        for (std::size_t i = 0; i < pixels.size(); i += 4) std::swap(pixels[i], pixels[i + 2]);
+                    }
+                    dumpWriter.Enqueue(slot.dumpIndex, slot.sourceWidth, slot.sourceHeight, false, std::move(pixels), true);
+                    std::fprintf(stderr, "[present-source] dump=%d slot=%zu batch=%llu fence_status=%d vk_image=%llx storage_object=%p device=%p generation=%llu vk_format=%d width=%u height=%u layer=%u rgb_nonzero=%llu pixels=%llu\n", slot.dumpIndex, static_cast<std::size_t>(&slot - presentSlots.data()), static_cast<unsigned long long>(slot.recorderSerial), static_cast<int>(status), static_cast<unsigned long long>(slot.sourceImage), slot.sourceObject, static_cast<void*>(device), static_cast<unsigned long long>(slot.sourceGeneration), static_cast<int>(slot.sourceFormat), slot.sourceWidth, slot.sourceHeight, slot.sourceLayer, static_cast<unsigned long long>(nonzero), static_cast<unsigned long long>(static_cast<std::uint64_t>(slot.sourceWidth) * slot.sourceHeight));
                     CaptureTrace::LogBestEffort("present-source dump=%d vk_image=%llx storage_object=%p device=%p generation=%llu vk_format=%d width=%u height=%u layer=%u rgb_nonzero=%llu pixels=%llu", slot.dumpIndex, static_cast<unsigned long long>(slot.sourceImage), slot.sourceObject, static_cast<void*>(device), static_cast<unsigned long long>(slot.sourceGeneration), static_cast<int>(slot.sourceFormat), slot.sourceWidth, slot.sourceHeight, slot.sourceLayer, static_cast<unsigned long long>(nonzero), static_cast<unsigned long long>(static_cast<std::uint64_t>(slot.sourceWidth) * slot.sourceHeight));
-                } else CaptureTrace::LogBestEffort("present-source-discard dump=%d fence_status=%d", slot.dumpIndex, static_cast<int>(status));
+                } else {
+                    std::fprintf(stderr, "[present-source-unavailable] dump=%d reason=fence fence_status=%d\n", slot.dumpIndex, static_cast<int>(status));
+                    CaptureTrace::LogBestEffort("present-source-discard dump=%d fence_status=%d", slot.dumpIndex, static_cast<int>(status));
+                }
             } catch (const std::exception& error) {
-                std::fprintf(stderr, "[gpu] source readback discarded: %s\n", error.what());
+                std::fprintf(stderr, "[present-source-unavailable] dump=%d reason=readback error=%s\n", slot.dumpIndex, error.what());
                 CaptureTrace::LogBestEffort("present-source-discard dump=%d error=readback", slot.dumpIndex);
             } catch (...) {
-                std::fprintf(stderr, "[gpu] source readback discarded: unknown error\n");
+                std::fprintf(stderr, "[present-source-unavailable] dump=%d reason=unknown\n", slot.dumpIndex);
                 CaptureTrace::LogBestEffort("present-source-discard dump=%d error=unknown", slot.dumpIndex);
             }
         }
@@ -3335,6 +3347,13 @@ void WriteFrameBmp(int index, std::uint32_t width, std::uint32_t height, std::sp
     frameDumpOutput.Write_nid_no_patch(name, width, height, pixels);
 }
 
+void WriteSourceBmp(int index, std::uint32_t width, std::uint32_t height, std::span<const std::byte> pixels) {
+    if (!frameDumpOutput.Enabled_nid_no_patch()) return;
+    char name[32];
+    std::snprintf(name, sizeof(name), "source_%03d.bmp", index);
+    frameDumpOutput.Write_nid_no_patch(name, width, height, pixels);
+}
+
 ResidentPresent ResidentPresentable(const Graphics::Context& context, const Graphics::StorageTexture& image, const DisplayBuffer& buffer, VkFilter& filter, std::uint32_t& layer) {
     const auto& descriptor = image.Descriptor();
     if (descriptor.width != buffer.width || descriptor.height != buffer.height || descriptor.mipCount != 1 || image.ImageDepth() != 1) return ResidentPresent::None;
@@ -3517,6 +3536,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
                 dumpFrame = true;
             }
         }
+        if (cpuDump && std::getenv("APS5_DUMP_PRESENT_SOURCE") != nullptr) std::fprintf(stderr, "[present-source-unavailable] dump=%d reason=cpu-output\n", *cpuDump);
         const bool screenshot = takeScreenshot(dumpFrame);
         if (cpuDump && passthrough) QueueFrameDump(state->dumpWriter, *cpuDump, buffer.width, buffer.height, ReadDisplayBuffer(buffer));
         else if (cpuDump) QueueFrameDump(state->dumpWriter, *cpuDump, buffer.width, buffer.height, pixels);
@@ -3575,6 +3595,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
         lastReport = std::chrono::steady_clock::now();
         AgcDriver::ProfilePrint_nid_no_patch("[flip] (cumulative): %llu presents from the resident image (%llu refreshed first), through guest memory: %llu not pending, %llu unsuitable; %llu GPU frame dumps\n", static_cast<unsigned long long>(residentPresents), static_cast<unsigned long long>(refreshedPresents), static_cast<unsigned long long>(notPending), static_cast<unsigned long long>(unsuitable), static_cast<unsigned long long>(gpuDumps));
     }
+    if (cpuDump && std::getenv("APS5_DUMP_PRESENT_SOURCE") != nullptr) std::fprintf(stderr, "[present-source-unavailable] dump=%d reason=cpu-output\n", *cpuDump);
     const bool screenshot = takeScreenshot(dumpFrame);
     if (cpuDump) QueueFrameDump(state->dumpWriter, *cpuDump, buffer.width, buffer.height, DisplayPixels(buffer, cleared));
     const bool cpuScreenshot = screenshot && passthrough && resident == nullptr;
@@ -3708,6 +3729,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("pixel_upload");
     APS5_LOG_OUT_DEBUG("present source=%s bytes=%zu", pixels.empty() ? "clear" : "pixels", pixels.size());
     static const bool sourceReadback = std::getenv("APS5_DUMP_PRESENT_SOURCE") != nullptr;
+    if (sourceReadback && dumpFrame && (!resident || (!drawn && !direct))) std::fprintf(stderr, "[present-source-unavailable] dump=%d reason=path resident=%d drawn=%d direct=%d vk_format=%d layer=%u\n", state->nextDumpIndex, resident != nullptr, drawn, direct, static_cast<int>(resident ? resident->ImageFormat() : VK_FORMAT_UNDEFINED), residentLayer);
     bool sourceRecorded = false;
     auto commands = slot.commands;
     check(state->DeviceFunction<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(commands, 0), "vkResetCommandBuffer");
@@ -3798,12 +3820,12 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             residentBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
             pipelineBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, residentStage, 0, 0, nullptr, 0, nullptr, 1, &residentBarrier);
             Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
-            if (sourceReadback && dumpFrame && !state->nextDumpScreenshot && drawn) {
+            if (sourceReadback && dumpFrame && !state->nextDumpScreenshot && (drawn || direct)) {
                 const auto format = resident->ImageFormat();
                 const auto& descriptor = resident->Descriptor();
                 const bool supported = format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB || format == VK_FORMAT_B8G8R8A8_SRGB;
                 const auto w = descriptor.width, h = descriptor.height;
-                if (supported && resident->ImageDepth() == 1 && descriptor.samples == 1 && residentLayer < resident->ImageLayers() && w && h && static_cast<std::uint64_t>(w) * h <= std::numeric_limits<std::size_t>::max() / 4) {
+                if (supported && resident->ImageDepth() == 1 && descriptor.samples == 1 && residentLayer < resident->ImageLayers() && w && h && static_cast<std::uint64_t>(w) * h <= 64u * 1024u * 1024u / 4u) {
                     const auto bytes = static_cast<std::size_t>(w) * h * 4;
                     if (!slot.sourceBuffer || slot.sourceBuffer->Bytes().size() != bytes) slot.sourceBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
                     auto transfer = residentBarrier;
@@ -3819,15 +3841,18 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
                     host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                     host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                     host.buffer = slot.sourceBuffer->Handle(); host.size = VK_WHOLE_SIZE;
-                    transfer.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; transfer.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                    pipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 1, &host, 1, &transfer);
+                    transfer.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; transfer.dstAccessMask = residentRead;
+                    pipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | residentStage, 0, 0, nullptr, 1, &host, 1, &transfer);
                     slot.sourceWidth = w; slot.sourceHeight = h; slot.sourceLayer = residentLayer;
                     slot.sourceFormat = format; slot.sourceGeneration = resident->Generation(); slot.sourceObject = resident.get();
                     const auto source = resident->Image(); slot.sourceImage = 0;
                     static_assert(sizeof(source) <= sizeof(slot.sourceImage));
                     std::memcpy(&slot.sourceImage, &source, sizeof(source));
                     sourceRecorded = true;
-                } else CaptureTrace::LogBestEffort("present-source-unsupported dump=%d vk_format=%d width=%u height=%u layer=%u", state->nextDumpIndex, static_cast<int>(format), w, h, residentLayer);
+                } else {
+                    std::fprintf(stderr, "[present-source-unavailable] dump=%d reason=unsupported vk_format=%d width=%u height=%u depth=%u samples=%u layer=%u layers=%u\n", state->nextDumpIndex, static_cast<int>(format), w, h, resident->ImageDepth(), descriptor.samples, residentLayer, resident->ImageLayers());
+                    CaptureTrace::LogBestEffort("present-source-unsupported dump=%d vk_format=%d width=%u height=%u layer=%u", state->nextDumpIndex, static_cast<int>(format), w, h, residentLayer);
+                }
             }
             if (residentConvert && !drawn) {
                 state->colorTransfer->DetileImage(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, Graphics::ColorTileMode::RenderTarget, DisplayRedLow(display->pixelFormat), DisplayTenBit(display->pixelFormat), DisplayHalfFloat(display->pixelFormat), residentLayer);

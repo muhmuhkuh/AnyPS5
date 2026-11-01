@@ -198,7 +198,8 @@ Fields FieldsOf(const std::string& line) {
 int main(int argc, char** argv) {
     try {
         const bool off = argc == 2 && std::string_view(argv[1]) == "--off";
-        Require(argc == 1 || off, "expected --off or no argument");
+        const bool direct = argc == 2 && std::string_view(argv[1]) == "--direct";
+        Require(argc == 1 || off || direct, "expected --off, --direct or no argument");
         auto temp=std::filesystem::absolute(std::filesystem::current_path() / "build/present-source-readback-tests" / ("run-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())));
         std::filesystem::create_directories(temp); std::filesystem::current_path(temp);
         const auto trace=(temp/"trace.log").string();
@@ -260,7 +261,7 @@ int main(int argc, char** argv) {
                 }
                 RecordMemoryBarrier(context,commands,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT);
                 image->MarkSliceDirty(layer);
-                const AgcDriver::DisplayBuffer display{memory.Address()+layer*65536u,0x8000000000000000ull,128,128};
+                const AgcDriver::DisplayBuffer display{memory.Address()+layer*65536u,direct ? 0x8000000022000000ull : 0x8000000000000000ull,128,128};
                 device.Resize(128, 128);
                 device.SelectDynamicRange(&display);
                 lock.unlock();
@@ -307,7 +308,8 @@ int main(int argc, char** argv) {
                 const auto& present=presents.at(i);
                 Require(present.at("resident")=="1", "fixture did not use a resident image");
                 if (off) continue;
-                Require(present.at("convert")=="1", "fixture did not use resident conversion");
+                Require(present.at("convert")== (direct ? "0" : "1"), "fixture used the wrong resident conversion path");
+                Require(blits.at(i).at("direct")== (direct ? "1" : "0"), "fixture used the wrong blit path");
                 const auto layer=i==3 ? "1" : "0";
                 Require(present.at("selected_layer")==layer,"wrong selected array layer");
                 const auto& source=sources.at(i);
@@ -320,6 +322,23 @@ int main(int argc, char** argv) {
         for (int i=0; i<4; ++i) {
             char name[32]; std::snprintf(name,sizeof(name),"frame_%03d.bmp",i);
             Require(std::filesystem::exists(temp/name), "normal BMP output missing");
+            std::snprintf(name,sizeof(name),"source_%03d.bmp",i);
+            if (off) {
+                Require(!std::filesystem::exists(temp/name), "disabled source diagnostic wrote a BMP");
+                continue;
+            }
+            std::ifstream source(temp/name, std::ios::binary);
+            const std::vector<unsigned char> bmp{std::istreambuf_iterator<char>(source),std::istreambuf_iterator<char>()};
+            Require(bmp.size()==54u+128u*128u*4u && bmp[0]=='B' && bmp[1]=='M', "source BMP missing or malformed");
+            const auto red = [](const auto& data, std::size_t offset) { return data[offset]==0 && data[offset+1]==0 && data[offset+2]==255; };
+            const auto black = [](const auto& data, std::size_t offset) { return data[offset]==0 && data[offset+1]==0 && data[offset+2]==0; };
+            Require((i==0 || i==3) ? red(bmp,54) : black(bmp,54), "source BMP first pixel has the wrong color");
+            if (i==2) Require(red(bmp,54+(19u*128u+17u)*4u), "source BMP omitted the single red pixel");
+            std::snprintf(name,sizeof(name),"frame_%03d.bmp",i);
+            std::ifstream output(temp/name, std::ios::binary);
+            const std::vector<unsigned char> frame{std::istreambuf_iterator<char>(output),std::istreambuf_iterator<char>()};
+            Require(frame.size()>=58 && frame[0]=='B' && frame[1]=='M', "output BMP missing or malformed");
+            Require((i==0 || i==3) ? !black(frame,54) : black(frame,54), "paired output BMP first pixel has the wrong brightness");
         }
         return 0;
     } catch(const std::exception& e) { std::fprintf(stderr,"source readback test failed: %s\n",e.what()); return 1; }
