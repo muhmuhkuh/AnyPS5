@@ -36,6 +36,8 @@
 namespace GuestAllocations {
 namespace {
 
+constexpr std::uint64_t GpuRangeBytes = 64ull << 20u;
+
 struct Registry {
     std::mutex mutex;
     std::map<std::uint64_t, std::shared_ptr<const Range>> ranges;
@@ -407,7 +409,18 @@ void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t 
         const auto& previous = *std::prev(next)->second;
         require(previous.address + previous.bytes <= address, "overlapping guest allocation");
     }
-    ranges.emplace(address, std::make_shared<const Range>(Range{address, bytes, readable, writable, address, bytes, true, gpu, freshBacking()}));
+    const auto backing = freshBacking();
+    if (!gpu || bytes <= GpuRangeBytes) {
+        ranges.emplace(address, std::make_shared<const Range>(Range{address, bytes, readable, writable, address, bytes, true, gpu, backing}));
+        return;
+    }
+    std::map<std::uint64_t, std::shared_ptr<const Range>> segments;
+    for (auto cursor = address; cursor < address + bytes;) {
+        const auto length = std::min<std::uint64_t>(address + bytes - cursor, GpuRangeBytes);
+        segments.emplace(cursor, std::make_shared<const Range>(Range{cursor, static_cast<std::size_t>(length), readable, writable, address, bytes, true, gpu, backing}));
+        cursor += length;
+    }
+    ranges.merge(segments);
 }
 
 [[noreturn]] void PinnedFailure(std::uintptr_t address, std::size_t bytes, const char* why) {
@@ -606,7 +619,11 @@ RangePatch replaceRange(const void* pointer, std::size_t bytes, bool remove, boo
         require(base <= cursor, "guest protection or unmap range has a hole");
         patch.erased.push_back(base);
         const auto insert = [&](std::uint64_t first, std::uint64_t last, bool canRead, bool canWrite, bool gpuMapped, std::uint64_t backing) {
-            if (first < last) patch.inserted.emplace_back(first, std::make_shared<const Range>(Range{first, static_cast<std::size_t>(last - first), canRead, canWrite, range.allocationAddress, range.allocationBytes, range.releasable, gpuMapped, backing}));
+            while (first < last) {
+                const auto length = gpuMapped && last - first > GpuRangeBytes ? std::min<std::uint64_t>(last - first, GpuRangeBytes - (first - range.allocationAddress) % GpuRangeBytes) : last - first;
+                patch.inserted.emplace_back(first, std::make_shared<const Range>(Range{first, static_cast<std::size_t>(length), canRead, canWrite, range.allocationAddress, range.allocationBytes, range.releasable, gpuMapped, backing}));
+                first += length;
+            }
         };
         insert(base, std::max<std::uint64_t>(base, address), range.readable, range.writable, range.gpu, range.backingSerial);
         if (!remove) insert(std::max<std::uint64_t>(base, address), std::min<std::uint64_t>(finish, end), readable, writable, gpu, freshBacking());
