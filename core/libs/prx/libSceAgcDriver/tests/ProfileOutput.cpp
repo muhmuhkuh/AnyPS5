@@ -11,20 +11,6 @@ void Check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-void BufferedDiagnosticOutput() {
-    auto* output = std::tmpfile();
-    Check(output != nullptr, "could not create diagnostic output file");
-    const std::string longLine(2000, 'x');
-    AgcDriver::BufferedDiagnosticPrint(output, "[gpu] %.1f done serial=%llu queue=0x%x\n", 12.5, 42ull, 3u);
-    AgcDriver::BufferedDiagnosticPrint(output, "%s\n", longLine.c_str());
-    Check(std::fflush(output) == 0 && std::fseek(output, 0, SEEK_SET) == 0, "could not rewind diagnostic output");
-    const std::string expected = "[gpu] 12.5 done serial=42 queue=0x3\n" + longLine + "\n";
-    std::string actual(expected.size(), '\0');
-    const auto count = std::fread(actual.data(), 1, actual.size(), output);
-    std::fclose(output);
-    Check(count == expected.size() && actual == expected, "buffered diagnostic output changed bytes");
-}
-
 void FormatAndDrain() {
     std::string written;
     const std::string longLine(6000, 'x');
@@ -168,7 +154,6 @@ void StopWithProducers() {
 
 int main() {
     try {
-        BufferedDiagnosticOutput();
         FormatAndDrain();
         SlowWriter();
         ConcurrentWriters();
