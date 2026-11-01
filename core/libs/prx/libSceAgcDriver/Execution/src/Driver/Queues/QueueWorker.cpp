@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -185,7 +186,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 auto& worker = workers.at(id);
                 auto& pending = worker.pending;
                 workerQueued() = &worker.queued;
-                if (traceGpu && pending.empty()) std::fprintf(stderr, "[gpu] %.1f idle queue=0x%x\n", TraceMs(), id);
+                if (traceGpu && pending.empty()) AgcDriver::BufferedDiagnosticPrint(stderr, "[gpu] %.1f idle queue=0x%x\n", TraceMs(), id);
                 const auto ready = [&] { return failure || stopping || !pending.empty(); };
                 const auto allQueuesIdle = [&] {
                     return runningWorkers.load(std::memory_order_acquire) == 0
@@ -275,7 +276,7 @@ void Driver::run(std::uint32_t id) noexcept {
             }
             execute(submission);
             if (submission.progress && submission.rewindTail == nullptr && !completionDeferred()) submitOpenWork(submission.progress);
-            if (traceGpu) std::fprintf(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
+            if (traceGpu) AgcDriver::BufferedDiagnosticPrint(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             PerformanceContext completionContext(id == 0 ? frameTiming() : FrameTiming::Async());
             PerformanceTimer completionTiming("Driver.Completion");

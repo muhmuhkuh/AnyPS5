@@ -17,6 +17,17 @@
 
 namespace AgcDriver {
 
+template<typename... TArgs>
+void BufferedDiagnosticPrint(std::FILE* output, const char* format, TArgs... args) {
+    std::array<char, 1024> buffer;
+    const auto size = std::snprintf(buffer.data(), buffer.size(), format, args...);
+    if (size < 0 || static_cast<std::size_t>(size) >= buffer.size()) {
+        std::fprintf(output, format, args...);
+    } else {
+        std::fwrite(buffer.data(), 1, static_cast<std::size_t>(size), output);
+    }
+}
+
 class ProfileOutput {
 public:
     explicit ProfileOutput(std::function<void(std::string_view)> writer, std::size_t capacity = 4 * 1024 * 1024) : writer(std::move(writer)), capacity(capacity) {
