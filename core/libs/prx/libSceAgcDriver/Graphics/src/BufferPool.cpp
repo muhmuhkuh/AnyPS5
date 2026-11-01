@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -20,6 +21,41 @@ namespace AgcDriver::Graphics {
 thread_local bool completedKeepReclaim = false;
 
 namespace {
+
+struct StagingObserved {
+    std::uint64_t generation;
+    std::uint64_t bytes;
+};
+struct StagingReclaimState {
+    std::mutex mutex;
+    std::map<std::pair<VkDevice, VkDeviceMemory>, StagingObserved> live;
+    std::uint64_t entries = 0;
+    std::uint64_t registered = 0;
+    std::uint64_t selectedBytes = 0;
+    std::uint64_t freed = 0;
+    std::uint64_t freedBytes = 0;
+    std::uint64_t unknown = 0;
+    std::uint64_t unknownBytes = 0;
+    std::uint64_t duplicates = 0;
+    std::uint64_t events = 0;
+};
+bool stagingReclaimEnabled() noexcept {
+    static const bool enabled = std::getenv("APS5_DIAG_STAGING_RECLAIM") != nullptr;
+    return enabled;
+}
+StagingReclaimState& stagingReclaimState() {
+    static auto& state = *new StagingReclaimState();
+    return state;
+}
+void logStagingReclaim(StagingReclaimState& state, const char* event, VkDevice device, VkDeviceMemory memory, std::uint64_t generation, std::uint64_t bytes) noexcept {
+    const auto n = ++state.events;
+    if (n > 64 && (n & (n - 1)) != 0) return;
+    std::fprintf(stderr, "[staging-reclaim] event=%s device=%p memory=%p generation=%llu bytes=%llu entries=%llu registered=%llu selected-bytes=%llu freed=%llu freed-bytes=%llu pending=%zu unknown=%llu unknown-bytes=%llu duplicates=%llu events=%llu\n",
+        event, static_cast<void*>(device), static_cast<void*>(memory), static_cast<unsigned long long>(generation), static_cast<unsigned long long>(bytes),
+        static_cast<unsigned long long>(state.entries), static_cast<unsigned long long>(state.registered), static_cast<unsigned long long>(state.selectedBytes),
+        static_cast<unsigned long long>(state.freed), static_cast<unsigned long long>(state.freedBytes), state.live.size(),
+        static_cast<unsigned long long>(state.unknown), static_cast<unsigned long long>(state.unknownBytes), static_cast<unsigned long long>(state.duplicates), static_cast<unsigned long long>(n));
+}
 
 std::uint64_t CommitReserve() {
     static const auto bytes = [] {
@@ -112,6 +148,60 @@ bool systemMemoryHeap(const VkPhysicalDeviceMemoryProperties& memory, std::uint3
 
 constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
+}
+
+void StagingReclaimEntry() noexcept {
+    if (!stagingReclaimEnabled()) return;
+    try {
+        auto& state = stagingReclaimState();
+        std::lock_guard lock(state.mutex);
+        ++state.entries;
+        logStagingReclaim(state, "entry", VK_NULL_HANDLE, VK_NULL_HANDLE, 0, 0);
+    } catch (...) {}
+}
+
+void StagingReclaimTrack(VkDevice device, VkDeviceMemory memory, VkDeviceSize bytes, bool slab) noexcept {
+    if (!stagingReclaimEnabled()) return;
+    try {
+        auto& state = stagingReclaimState();
+        std::lock_guard lock(state.mutex);
+        const auto key = std::make_pair(device, memory);
+        if (device == VK_NULL_HANDLE || memory == VK_NULL_HANDLE || bytes == 0 || slab || state.live.size() >= 16384) {
+            ++state.unknown;
+            state.unknownBytes += bytes;
+            logStagingReclaim(state, "unknown", device, memory, 0, bytes);
+            return;
+        }
+        if (state.live.contains(key)) {
+            ++state.duplicates;
+            logStagingReclaim(state, "duplicate", device, memory, state.live.at(key).generation, bytes);
+            return;
+        }
+        const auto generation = state.registered + 1;
+        state.live.emplace(key, StagingObserved{generation, bytes});
+        ++state.registered;
+        state.selectedBytes += bytes;
+        logStagingReclaim(state, "tracked", device, memory, generation, bytes);
+    } catch (...) {
+        std::fprintf(stderr, "[staging-reclaim] tracking-failed unknown=1\n");
+    }
+}
+
+void StagingReclaimDriverFreed(VkDevice device, VkDeviceMemory memory) noexcept {
+    if (!stagingReclaimEnabled() || memory == VK_NULL_HANDLE) return;
+    try {
+        auto& state = stagingReclaimState();
+        std::lock_guard lock(state.mutex);
+        const auto found = state.live.find({device, memory});
+        if (found == state.live.end()) return;
+        const auto observed = found->second;
+        state.live.erase(found);
+        ++state.freed;
+        state.freedBytes += observed.bytes;
+        logStagingReclaim(state, "driver-free", device, memory, observed.generation, observed.bytes);
+    } catch (...) {
+        std::fprintf(stderr, "[staging-reclaim] free-tracking-failed unknown=1\n");
+    }
 }
 
 void ForgetCommitAllocation(VkDevice device, VkDeviceMemory memory) {
@@ -477,6 +567,7 @@ VkDeviceSize BufferPool::destroy(const BufferAllocation& allocation) noexcept {
     if (allocation.buffer != VK_NULL_HANDLE) destroyBuffer(device, allocation.buffer, nullptr);
     CommitAllocation(device, allocation.memory);
     freeMemory(device, allocation.memory, nullptr);
+    if (!IsDeferredFreeMemory(freeMemory)) StagingReclaimDriverFreed(device, allocation.memory);
     return allocation.allocationBytes;
 }
 

@@ -19,6 +19,7 @@
 
 namespace AgcDriver::Graphics {
 
+void StagingReclaimTrack(VkDevice device, VkDeviceMemory memory, VkDeviceSize bytes, bool slab) noexcept;
 void ShutdownGuestBufferWorkers();
 
 struct GuestMemorySnapshot {
@@ -393,6 +394,13 @@ public:
             found = true;
         }
         return found ? context.bufferPool : nullptr;
+    }
+    void ObserveIdleStaging() const noexcept {
+        for (const auto& region : regions) {
+            if (!region.gpuCopy || !region.deviceLocal || region.buffer == nullptr) continue;
+            const auto backing = region.buffer->Backing();
+            StagingReclaimTrack(context.device, backing.memory, backing.bytes, backing.slab);
+        }
     }
     // Every uploaded region as [begin, end) when all of them are served by host imports, in place or
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the

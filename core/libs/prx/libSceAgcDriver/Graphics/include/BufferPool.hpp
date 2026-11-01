@@ -16,6 +16,9 @@
 namespace AgcDriver::Graphics {
 
 void ForgetCommitAllocation(VkDevice device, VkDeviceMemory memory);
+void StagingReclaimEntry() noexcept;
+void StagingReclaimTrack(VkDevice device, VkDeviceMemory memory, VkDeviceSize bytes, bool slab) noexcept;
+void StagingReclaimDriverFreed(VkDevice device, VkDeviceMemory memory) noexcept;
 std::uint64_t TrackedCommitAllocationBytes(VkDevice device, VkDeviceMemory memory);
 
 struct BufferAllocation {

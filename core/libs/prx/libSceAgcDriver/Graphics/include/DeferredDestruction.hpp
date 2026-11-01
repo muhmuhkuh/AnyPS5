@@ -7,6 +7,7 @@
 
 namespace AgcDriver::Graphics {
 
+bool IsDeferredFreeMemory(PFN_vkFreeMemory function) noexcept;
 PFN_vkGetDeviceProcAddr DeferDestructionToIdle(VkDevice device, PFN_vkGetDeviceProcAddr resolver);
 void DestroyDeferredAtIdle(const Context& context, std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
 void DestroyDeferredObjects(VkDevice device) noexcept;

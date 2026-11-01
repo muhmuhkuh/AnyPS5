@@ -312,6 +312,7 @@ public:
         if (context.device != device || !completed || !reusable || NeedsCompletion() || usesBda || !textures.empty() || !storageTextures.empty() || TableElements() != 0) return {};
         return guestMemory.IdleStagingPool();
     }
+    void ObserveIdleStaging() const noexcept { guestMemory.ObserveIdleStaging(); }
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);

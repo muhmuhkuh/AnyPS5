@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -4045,6 +4046,8 @@ bool stagingCacheLifetimeTests(const Device& device, Recorder& recorder) {
     Require(HostImportFor(context, address, bytes) != nullptr, "staging lifetime import unavailable");
     auto poolContext = context;
     StagingFreeProbe probe(poolContext);
+    const bool deferred = std::getenv("APS5_TEST_STAGING_DEFERRED") != nullptr;
+    if (deferred) poolContext.deviceProc = DeferDestructionToIdle(context.device, poolContext.deviceProc);
     context.bufferPool = std::make_shared<BufferPool>(poolContext);
     auto& cache = SharedResourceCache();
     Require(cache.Size() == 0, "staging pressure cache is not empty");
@@ -4113,6 +4116,11 @@ bool stagingCacheLifetimeTests(const Device& device, Recorder& recorder) {
     const auto pressureBytes = backing.bytes;
     const auto pressureReleased = ReleaseTextureCaches(pressureBytes);
     const auto pressurePool = context.bufferPool->ReclaimUnused();
+    if (deferred) {
+        Require(!probe.Freed(pressureMemory), "deferred staging allocation reached the driver early");
+        std::cout << "staging-deferred before-drain driver-free=0\n";
+        DestroyDeferredObjects(context.device);
+    }
     const bool pressureCached = cache.Find(key) != nullptr;
     const bool pressureFreed = probe.Freed(pressureMemory);
     std::cout << "staging-pressure completed=" << recorder.CompletedThrough() << " memory=" << pressureMemory << " bytes=" << pressureBytes << " cache=" << pressureCached << " buffer-owners=" << staged.use_count() << " expired=" << staged.expired() << " driver-free=" << pressureFreed << " reported=" << pressureReleased << " pool-reclaimed=" << pressurePool << '\n';
@@ -4154,6 +4162,7 @@ bool stagingCacheLifetimeTests(const Device& device, Recorder& recorder) {
     std::cout << "staging completion=" << serial << " buffer-owners=" << staged.use_count() << " build-owners=" << build.use_count() << '\n';
     Require(staged.expired(), "completed staging buffer remains owned");
     const auto reclaimed = context.bufferPool->ReclaimUnused();
+    if (deferred) DestroyDeferredObjects(context.device);
     Require(probe.Freed(backing.memory), "staging allocation did not reach vkFreeMemory");
     std::cout << "staging lifetime memory=" << backing.memory << " bytes=" << backing.bytes << " completed=" << serial << " reclaimed=" << reclaimed << " driver-free=1\n";
     {
@@ -4162,6 +4171,7 @@ bool stagingCacheLifetimeTests(const Device& device, Recorder& recorder) {
     }
     HostImportFor(context, address, bytes);
     context.bufferPool.reset();
+    if (deferred) DestroyDeferredObjects(context.device);
     return true;
 }
 

@@ -1904,6 +1904,8 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
                 auto resource = SharedResourceCache().TryTakeIdleStaged(recorder->Device());
                 if (resource == nullptr) break;
                 auto pool = resource->IdleStagingPool(recorder->Device());
+                StagingReclaimEntry();
+                resource->ObserveIdleStaging();
                 resource.reset();
                 if (pool == nullptr) break;
                 const auto released = pool->ReclaimUnused();

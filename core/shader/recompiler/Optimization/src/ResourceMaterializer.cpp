@@ -40,6 +40,34 @@ namespace {
 
 using ImageTableAbi::PoisonReason;
 
+struct FirstReadEntry {
+    std::uint64_t address;
+    std::uint32_t value;
+    bool ok;
+    bool special;
+};
+
+struct FirstReadCapture {
+    SrtMemoryReader normal = nullptr;
+    SrtMemoryReader special = nullptr;
+    std::vector<FirstReadEntry> entries;
+    std::size_t dropped = 0;
+};
+
+thread_local FirstReadCapture* firstReadCapture = nullptr;
+
+bool firstRead(void* context, std::uint64_t address, std::uint32_t* value, bool special) {
+    auto& capture = *firstReadCapture;
+    const auto reader = special ? capture.special : capture.normal;
+    const bool ok = reader != nullptr && reader(context, address, value);
+    if (capture.entries.size() < 16384u) capture.entries.push_back({address, ok ? *value : 0u, ok, special});
+    else ++capture.dropped;
+    return ok;
+}
+
+bool firstReadNormal(void* context, std::uint64_t address, std::uint32_t* value) { return firstRead(context, address, value, false); }
+bool firstReadSpecial(void* context, std::uint64_t address, std::uint32_t* value) { return firstRead(context, address, value, true); }
+
 thread_local std::unordered_set<std::uint64_t> largeTableProbePrograms;
 
 std::atomic<std::uint64_t> specializationNanoseconds{0};
@@ -2675,6 +2703,22 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
     const auto materializeStarted = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     SrtWalker walker;
     ResourceSnapshot nextSnapshot;
+    FirstReadCapture firstReads;
+    SrtReadTrace firstReadTrace;
+    auto observedRuntime = runtime;
+    const bool captureFirstReads = std::getenv("APS5_DIAG_FIRST_SRT_READ") != nullptr;
+    struct CaptureScope {
+        FirstReadCapture* previous;
+        ~CaptureScope() { firstReadCapture = previous; }
+    } captureScope{firstReadCapture};
+    if (captureFirstReads) {
+        firstReads.normal = runtime.readMemory;
+        firstReads.special = runtime.readSpecializationMemory;
+        firstReadCapture = &firstReads;
+        if (runtime.readMemory != nullptr) observedRuntime.readMemory = firstReadNormal;
+        if (runtime.readSpecializationMemory != nullptr) observedRuntime.readSpecializationMemory = firstReadSpecial;
+        if (observedRuntime.readTrace == nullptr) observedRuntime.readTrace = &firstReadTrace;
+    }
     struct ActiveSourcesStorage {};
     auto& activeSources = HostThreadLocal<std::vector<std::uint8_t>, ActiveSourcesStorage>();
     activeSources.clear();
@@ -2684,7 +2728,12 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
             const SrtForceSyncScope forceSync(runtime, attempt == 2u);
             const auto beforeSnapshot = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
             activeSources.clear();
-            materializeSnapshot(plan, runtime, walker, nextSnapshot, activeSources);
+            if (captureFirstReads) {
+                firstReads.entries.clear();
+                firstReads.dropped = 0;
+                firstReadTrace = {};
+            }
+            materializeSnapshot(plan, observedRuntime, walker, nextSnapshot, activeSources);
             const auto afterSnapshot = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
             TableSnapshotter(plan, runtime, walker, activeSources, nextSnapshot.tables).Run();
             const auto afterTables = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
@@ -2700,7 +2749,32 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
     }
     const auto started = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     materializeForcedDegamma(plan, nextSnapshot);
-    materializeTables(plan, nextSnapshot);
+    try {
+        materializeTables(plan, nextSnapshot);
+    } catch (...) {
+        if (captureFirstReads) {
+            std::fprintf(stderr, "[first-srt] shader=%llx stage=%u reads=%zu dropped=%zu\n", static_cast<unsigned long long>(runtime.shaderBase), static_cast<unsigned>(plan.stage), firstReads.entries.size(), firstReads.dropped);
+            for (std::size_t i = 0; i < runtime.userData.size(); ++i) std::fprintf(stderr, "[first-srt] user=%zu value=%08x\n", i, runtime.userData[i]);
+            for (const auto& entry : firstReads.entries) std::fprintf(stderr, "[first-srt] read=%llx value=%08x ok=%d special=%d\n", static_cast<unsigned long long>(entry.address), entry.value, entry.ok, entry.special);
+            for (const auto& [slot, address] : observedRuntime.readTrace->leaves) std::fprintf(stderr, "[first-srt] leaf=%u address=%llx\n", slot, static_cast<unsigned long long>(address));
+            for (std::size_t i = 0; i < plan.info.buffers.size(); ++i) {
+                const auto& buffer = plan.info.buffers[i];
+                const auto& descriptor = nextSnapshot.buffers.at(i);
+                if (decodeBufferDescriptor(descriptor).Type() == 0u) continue;
+                std::fprintf(stderr, "[first-srt] buffer=%zu source=%u pc=%x words=%08x,%08x,%08x,%08x\n", i, buffer.source, buffer.firstUsePc, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3]);
+                if (buffer.source >= plan.descriptorSources.size()) continue;
+                const auto& source = plan.descriptorSources[buffer.source];
+                for (std::uint32_t word = 0; word < source.dwordCount; ++word) {
+                    const auto* value = source.dwords[word]->Resolve();
+                    if (value->Opcode() != IrOpcode::ReadConst || value->ArgumentCount() < 2 || !value->Argument(1)->Resolve()->HasImmediate()) continue;
+                    const auto slot = value->Argument(1)->Resolve()->ImmediateU32();
+                    if (slot < nextSnapshot.flattenedSrt.size()) std::fprintf(stderr, "[first-srt] word=%u slot=%u value=%08x\n", word, slot, nextSnapshot.flattenedSrt[slot]);
+                }
+            }
+            std::fflush(stderr);
+        }
+        throw;
+    }
     materializeSrtGuards(plan, nextSnapshot);
     if (MaterializeProfiled()) specializationNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     snapshot = std::move(nextSnapshot);

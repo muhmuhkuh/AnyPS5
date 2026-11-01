@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -42,7 +43,10 @@ PFN_vkGetDeviceProcAddr resolverFor(VkDevice device) {
 
 void destroyAll(VkDevice device, const Deferred& deferred) noexcept {
     for (const auto buffer : deferred.buffers) deferred.destroyBuffer(device, buffer, nullptr);
-    for (const auto memory : deferred.memory) deferred.freeMemory(device, memory, nullptr);
+    for (const auto memory : deferred.memory) {
+        deferred.freeMemory(device, memory, nullptr);
+        StagingReclaimDriverFreed(device, memory);
+    }
 }
 
 template<typename THandle>
@@ -69,6 +73,7 @@ VKAPI_ATTR void VKAPI_CALL deferredDestroyBuffer(VkDevice device, VkBuffer buffe
 VKAPI_ATTR void VKAPI_CALL deferredFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* allocator) {
     if (memory == VK_NULL_HANDLE || defer(device, memory, &Deferred::memory)) return;
     reinterpret_cast<PFN_vkFreeMemory>(resolverFor(device)(device, "vkFreeMemory"))(device, memory, allocator);
+    StagingReclaimDriverFreed(device, memory);
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL deferringDeviceProc(VkDevice device, const char* name) {
@@ -78,6 +83,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL deferringDeviceProc(VkDevice device, co
 }
 
 }
+
+bool IsDeferredFreeMemory(PFN_vkFreeMemory function) noexcept { return function == &deferredFreeMemory; }
 
 PFN_vkGetDeviceProcAddr DeferDestructionToIdle(VkDevice device, PFN_vkGetDeviceProcAddr resolver) {
     if (device == VK_NULL_HANDLE || resolver == nullptr) throw std::invalid_argument("AGC graphics: deferred destruction needs a device and its resolver");
