@@ -1527,15 +1527,18 @@ public:
     [[nodiscard]] const std::filesystem::path& Directory() const { return directory; }
 
     bool Load(std::span<const std::byte> key, CompiledVariant& variant) {
+        LoadScope scope(*this);
         if (loadPrebuilt(key, variant)) return true;
         return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void> owner) { return DecodeEntry(file, key, variant, std::move(owner)); }, hits, misses, loadFailures);
     }
 
     bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
+        LoadScope scope(*this);
         return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodePlanEntry(file, key, plan); }, planHits, planMisses, planLoadFailures);
     }
 
     std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> key, std::uint64_t shaderHash) {
+        LoadScope scope(*this);
         std::shared_ptr<const IrResourcePlan> plan;
         load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) {
             std::span<const std::byte> payload;
@@ -1591,6 +1594,27 @@ public:
     }
 
     Counters Totals() const {
+        try {
+            std::lock_guard lock(counterMutex);
+            return totalsLocked();
+        } catch (...) {
+            observationLost.store(true);
+            return totalsLocked();
+        }
+    }
+
+    Observation Observe() const {
+        try {
+            std::lock_guard lock(counterMutex);
+            return {totalsLocked(), activeLoads.load(), Enabled(), observationLost.load()};
+        } catch (...) {
+            observationLost.store(true);
+            return {totalsLocked(), 0, Enabled(), true};
+        }
+    }
+
+private:
+    Counters totalsLocked() const {
         Counters counters;
         counters.hits = hits.load(std::memory_order_relaxed);
         counters.misses = misses.load(std::memory_order_relaxed);
@@ -1616,7 +1640,35 @@ public:
         return counters;
     }
 
-private:
+    class LoadScope {
+    public:
+        explicit LoadScope(DiskStore& owner) : owner(owner) {
+            auto current = owner.activeLoads.load();
+            for (;;) {
+                if (current == std::numeric_limits<std::uint64_t>::max()) { owner.observationLost.store(true); return; }
+                if (owner.activeLoads.compare_exchange_weak(current, current + 1)) { counted = true; return; }
+            }
+        }
+        ~LoadScope() {
+            if (counted && owner.activeLoads.fetch_sub(1) == 0) owner.observationLost.store(true);
+        }
+    private:
+        DiskStore& owner;
+        bool counted = false;
+    };
+
+    std::uint64_t count(std::atomic<std::uint64_t>& counter) {
+        try {
+            std::lock_guard lock(counterMutex);
+            const auto old = counter.fetch_add(1, std::memory_order_relaxed);
+            if (old == std::numeric_limits<std::uint64_t>::max()) observationLost.store(true);
+            return old;
+        } catch (...) {
+            observationLost.store(true);
+            return counter.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     void discoverPrebuilt() {
         const auto start = std::chrono::steady_clock::now();
         std::size_t entries = 0;
@@ -1680,7 +1732,7 @@ private:
         for (const auto& pack : packs) {
             const auto status = pack->Load(key, variant, timing);
             if (status == LoadStatus::Loaded) { loaded = true; break; }
-            if (status == LoadStatus::Rejected) prebuiltRejected.fetch_add(1, std::memory_order_relaxed);
+            if (status == LoadStatus::Rejected) count(prebuiltRejected);
         }
         lookupNanoseconds.fetch_add(timing.lookupNanoseconds, std::memory_order_relaxed);
         decodeNanoseconds.fetch_add(timing.decodeNanoseconds, std::memory_order_relaxed);
@@ -1699,7 +1751,7 @@ private:
                 decodeNanoseconds.fetch_add(elapsed(decode), std::memory_order_relaxed);
                 prebuiltBytesRead.fetch_add(file.size(), std::memory_order_relaxed);
                 if (status == LoadStatus::Rejected) {
-                    const auto failures = prebuiltRejected.fetch_add(1, std::memory_order_relaxed);
+                    const auto failures = count(prebuiltRejected);
                     if (failures < 8) std::fprintf(stderr, "[shader-prebuilt] rejected %s (%zu bytes): truncated, corrupt or another format; recompiling\n", name.c_str(), file.size());
                 }
                 if (status == LoadStatus::Loaded) { loaded = true; break; }
@@ -1707,9 +1759,9 @@ private:
             if (file.capacity() > (4u << 20u)) std::vector<std::byte>().swap(file);
         }
         if (loaded) {
-            const auto previous = prebuiltHits.fetch_add(1, std::memory_order_relaxed);
+            const auto previous = count(prebuiltHits);
             if (previous == 0) std::fprintf(stderr, "[shader-prebuilt] first exact-key hit loaded in %.3f ms\n", elapsed(started) / 1e6);
-        } else prebuiltMisses.fetch_add(1, std::memory_order_relaxed);
+        } else count(prebuiltMisses);
         if (loaded) {
             const auto duration = elapsed(started);
             prebuiltLoadNanoseconds.fetch_add(duration, std::memory_order_relaxed);
@@ -1736,20 +1788,20 @@ private:
         const bool present = owner != nullptr || ReadWholeFile(directory / name, file);
         if (owner == nullptr) bytes = file;
         if (!present) {
-            missCount.fetch_add(1, std::memory_order_relaxed);
+            count(missCount);
         } else {
             switch (decode(bytes, std::move(owner))) {
                 case LoadStatus::Loaded:
-                    hitCount.fetch_add(1, std::memory_order_relaxed);
+                    count(hitCount);
                     bytesRead.fetch_add(bytes.size(), std::memory_order_relaxed);
                     loaded = true;
                     break;
                 case LoadStatus::Absent:
                 case LoadStatus::KeyMismatch:
-                    missCount.fetch_add(1, std::memory_order_relaxed);
+                    count(missCount);
                     break;
                 case LoadStatus::Rejected: {
-                    const auto failures = failureCount.fetch_add(1, std::memory_order_relaxed);
+                    const auto failures = count(failureCount);
                     if (failures < 8) std::fprintf(stderr, "[shader-disk-cache] rejected %s (%zu bytes): truncated, corrupt or another format; recompiling\n", name.c_str(), bytes.size());
                     break;
                 }
@@ -1916,6 +1968,9 @@ private:
     std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0};
     std::atomic<std::uint64_t> prebuiltHits{0}, prebuiltMisses{0}, prebuiltRejected{0}, lookupNanoseconds{0}, readNanoseconds{0}, decodeNanoseconds{0}, maxLoadNanoseconds{0}, prebuiltBytesRead{0}, prebuiltLoadNanoseconds{0};
     std::atomic<std::int64_t> lastReport{0};
+    mutable std::mutex counterMutex;
+    std::atomic<std::uint64_t> activeLoads{0};
+    mutable std::atomic<bool> observationLost{false};
     std::mutex reportMutex;
     Counters reported;
     std::uint64_t reportedLoadNs = 0;
@@ -2121,6 +2176,10 @@ unsigned Writers() {
 
 Counters Totals() {
     return store().Totals();
+}
+
+Observation Observe() {
+    return store().Observe();
 }
 
 }

@@ -304,6 +304,7 @@ function(add_shader_recompiler target runtimeTarget)
             SetDebugProbeActive
             ShaderCacheDirectory
             ShaderDiskCache::Shutdown
+            ShaderDiskCache::Observe
             ShaderStage
             HashSpirvWords
             ShaderDiskCache::DecodeResult

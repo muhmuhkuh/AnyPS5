@@ -46,6 +46,13 @@ struct Counters {
     std::uint64_t prebuiltLoadNanoseconds = 0;
 };
 
+struct Observation {
+    Counters counters;
+    std::uint64_t activeLoads = 0;
+    bool enabled = false;
+    bool lost = false;
+};
+
 [[nodiscard]] std::uint64_t SourceVersion();
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key);
@@ -77,6 +84,7 @@ void Flush();
 void Shutdown();
 [[nodiscard]] unsigned Writers();
 [[nodiscard]] Counters Totals();
+[[nodiscard]] Observation Observe();
 
 }
 
