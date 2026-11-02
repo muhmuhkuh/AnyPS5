@@ -124,6 +124,16 @@ constexpr std::optional<std::uint32_t> ScalarBufferDword(std::uint32_t offset, s
     return dword;
 }
 
+constexpr bool WholeBufferColumn(std::uint64_t base, std::uint64_t size, std::uint32_t records, std::uint32_t addend, std::uint32_t stride, std::uint32_t immediate, std::uint32_t dwords) {
+    if (records == 0u || dwords <= 1u || dwords > 8u || (base & 3u) != 0u || size > ~std::uint64_t{0} - base) return false;
+    const auto advance = static_cast<std::uint64_t>(records - 1u) * stride;
+    if (advance > 0xffffffffull - addend) return false;
+    const auto offset = static_cast<std::uint64_t>(addend) + advance;
+    const auto last = static_cast<std::uint64_t>(immediate) + (dwords - 1u) * 4u;
+    if (last > 0xffffffffull || offset + last > 0xffffffffull) return false;
+    return ((offset + last) & ~3ull) + 4u <= size;
+}
+
 constexpr std::optional<std::uint64_t> ScalarAddressDword(std::uint64_t base, std::uint32_t offset, std::uint32_t immediate) {
     const std::uint64_t first = base + (offset & ~3u);
     if (first < base) return std::nullopt;

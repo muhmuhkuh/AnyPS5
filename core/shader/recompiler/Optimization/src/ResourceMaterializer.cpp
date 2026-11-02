@@ -394,6 +394,8 @@ struct TableCounters {
     std::atomic<std::uint64_t> selected{0};
     std::atomic<std::uint64_t> reusedUnwritten{0};
     std::atomic<std::uint64_t> reusedCompared{0};
+    std::atomic<std::uint64_t> boundsColumns{0};
+    std::atomic<std::uint64_t> boundsRecords{0};
     std::atomic<std::uint64_t> nanoseconds{0};
     std::atomic<std::uint64_t> columnHits{0};
     std::atomic<std::uint64_t> columnMisses{0};
@@ -662,6 +664,7 @@ void reportTables() {
     std::fprintf(stderr, "[image-table] (10 s): %llu snapshots, %llu tables, %llu keys, %llu selected records, structural poison:%s, narrowing %llu applied / %llu skipped%s%s, reused %llu unwritten / %llu compared, %.1f ms\n",
         static_cast<unsigned long long>(snapshots), static_cast<unsigned long long>(counters.tables.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.keys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.selected.exchange(0, std::memory_order_relaxed)), poison.empty() ? " none" : poison.c_str(),
         static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowSkipped.exchange(0, std::memory_order_relaxed)), skips.empty() ? "" : ":", skips.c_str(), static_cast<unsigned long long>(counters.reusedUnwritten.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.reusedCompared.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.nanoseconds.exchange(0, std::memory_order_relaxed)) / 1e6);
+    std::fprintf(stderr, "[image-table-bounds] (10 s): %llu columns, %llu records with prevalidated bounds\n", static_cast<unsigned long long>(counters.boundsColumns.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.boundsRecords.exchange(0, std::memory_order_relaxed)));
     if (TableColumnMemo()) {
         auto& memo = columnResolutionMemo();
         std::size_t entries = 0;
@@ -1408,6 +1411,8 @@ private:
             return total - words;
         };
         const auto last = (column.dwordCount - 1u) * 4u;
+        const bool provenBounds = !column.address && ImageTableAbi::WholeBufferColumn(records.base, records.size, records.keys, column.addend, column.stride, column.offset, column.dwordCount);
+        std::uint64_t provenRecords = 0;
         for (std::uint32_t record = 0; record < records.keys; record++) {
             if (records.states[record] != RecordState::Read) continue;
             const auto offset = column.addend + record * column.stride;
@@ -1415,8 +1420,9 @@ private:
                 records.states[record] = RecordState::Carried;
                 continue;
             }
-            const auto head = locate(offset, column.offset);
-            const auto tail = locate(offset, column.offset + last);
+            if (provenBounds) ++provenRecords;
+            const auto head = provenBounds ? std::optional<std::uint64_t>(records.base + ((static_cast<std::uint64_t>(offset) + column.offset) & ~3ull)) : locate(offset, column.offset);
+            const auto tail = provenBounds ? std::optional<std::uint64_t>(*head + last) : locate(offset, column.offset + last);
             if (head.has_value() && tail.has_value() && (*head & 3u) == 0u && *tail > *head && *tail - *head == last && wholeAccessible(*head) && wholeAccessible(*tail)) {
                 whole[record] = take(*head, column.dwordCount);
                 continue;
@@ -1434,6 +1440,10 @@ private:
                 slots[dword] = take(*address, 1u);
             }
             if (records.states[record] == RecordState::Read) split.emplace_back(record, slots);
+        }
+        if (provenBounds && MaterializeProfiled()) {
+            tableCounters().boundsColumns.fetch_add(1, std::memory_order_relaxed);
+            tableCounters().boundsRecords.fetch_add(provenRecords, std::memory_order_relaxed);
         }
         SlotLease<std::uint32_t> readLease(threadScratch<std::uint32_t, TableReadWordsTag>());
         auto& read = readLease.Slots();

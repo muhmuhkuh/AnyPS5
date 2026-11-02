@@ -2507,6 +2507,37 @@ bool PointerReadWords(void* context, std::uint64_t address, std::uint32_t* value
     return true;
 }
 
+void verifyWholeBufferColumnBounds() {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    require(Abi::WholeBufferColumn(0x1000u, 2048u, 64u, 0u, 32u, 0u, 8u), "table bounds: a complete regular column was not proven");
+    require(!Abi::WholeBufferColumn(0x1001u, 2048u, 64u, 0u, 32u, 0u, 8u), "table bounds: unaligned base was proven");
+    require(!Abi::WholeBufferColumn(0x1000u, 2047u, 64u, 0u, 32u, 0u, 8u), "table bounds: truncated final descriptor was proven");
+    require(!Abi::WholeBufferColumn(0x1000u, 0x100000000ull, 3u, 0xfffffff0u, 16u, 0u, 8u), "table bounds: wrapped record offsets were proven");
+    require(!Abi::WholeBufferColumn(~std::uint64_t{3}, 8u, 1u, 0u, 4u, 0u, 2u), "table bounds: wrapped base range was proven");
+    constexpr std::array<std::uint32_t, 9> strides{0u, 1u, 3u, 4u, 7u, 16u, 31u, 32u, 0xffffffffu};
+    constexpr std::array<std::uint32_t, 7> addends{0u, 1u, 3u, 4u, 17u, 0xfffffff0u, 0xffffffffu};
+    constexpr std::array<std::uint32_t, 7> immediates{0u, 1u, 3u, 4u, 19u, 0xfffffff0u, 0xffffffffu};
+    constexpr std::array<std::uint64_t, 8> sizes{0u, 4u, 31u, 32u, 127u, 256u, 0xffffffffull, 0x100000000ull};
+    std::size_t proven = 0;
+    for (const auto stride : strides) for (const auto addend : addends) for (const auto immediate : immediates) for (const auto size : sizes) for (const auto count : {1u, 2u, 5u, 8u}) for (const auto width : {2u, 4u, 8u}) {
+        if (!Abi::WholeBufferColumn(0x1000u, size, count, addend, stride, immediate, width)) continue;
+        ++proven;
+        for (std::uint32_t record = 0; record < count; ++record) {
+            const auto wideOffset = static_cast<std::uint64_t>(addend) + static_cast<std::uint64_t>(record) * stride;
+            require(wideOffset <= 0xffffffffull, "table bounds: a record offset overflowed");
+            const auto offset = static_cast<std::uint32_t>(wideOffset);
+            const auto first = Abi::ScalarBufferDword(offset, immediate, size);
+            require(first.has_value(), "table bounds: proven first word is outside the buffer");
+            for (std::uint32_t word = 0; word < width; ++word) {
+                const auto actual = Abi::ScalarBufferDword(offset, immediate + word * 4u, size);
+                require(actual.has_value() && *actual == *first + word * 4u, "table bounds: proven addresses differ from scalar reads");
+            }
+        }
+    }
+    require(proven != 0u, "table bounds: no regular columns were exercised");
+    std::cout << "table_column_bounds proven_cases=" << proven << " scalar_addresses=equal overflow_fallback=1 unaligned_fallback=1 partial_fallback=1\n";
+}
+
 void verifyImageTableBulkReads() {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
@@ -4351,12 +4382,11 @@ void verifyImageTablePopulateSamplerMasks() {
     }
 }
 
-void verifyImageTableCaptureBenchmark() {
+void verifyImageTableCaptureBenchmark(std::uint32_t repeat = 6u) {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
     constexpr std::uint32_t LargeEntries = 65536u;
     constexpr std::uint32_t UniqueEntries = 13000u;
-    constexpr std::uint32_t Repeat = 6u;
     static TableTexture textures[4];
     alignas(4096) static TableGuest guest;
     alignas(4096) static std::array<std::array<std::uint32_t, 8>, LargeEntries> heap{};
@@ -4467,7 +4497,7 @@ void verifyImageTableCaptureBenchmark() {
     const auto checkRepeated = [&](std::string_view label, const RecompileRequest& request, const ShaderInfo& info, std::uintptr_t begin, std::uintptr_t end, std::uintptr_t unmapped) {
         const auto baseline = run(request, info, begin, end, unmapped);
         report(label, 0u, baseline);
-        for (std::uint32_t iteration = 1; iteration < Repeat; iteration++) {
+        for (std::uint32_t iteration = 1; iteration < repeat; iteration++) {
             const auto sample = run(request, info, begin, end, unmapped);
             report(label, iteration, sample);
             require(sample.snapshot == baseline.snapshot && sameResolved(sample.resolved, baseline.resolved), "capture benchmark: repeated capture or resolution changed snapshot/output contents");
@@ -4486,6 +4516,12 @@ void verifyImageTableCaptureBenchmark() {
     const auto heapEnd = heapBegin + sizeof(heap);
     const auto valid = checkRepeated("valid-65k", wholeRequest, wholeInfo, heapBegin, heapEnd, 0u);
     require(valid.snapshot.tables.at(0).codes.size() == LargeEntries && valid.snapshot.tables.at(0).words.size() == UniqueEntries && valid.resolved.elements.size() == UniqueEntries, "capture benchmark: valid large table did not preserve all keys and distinct descriptors");
+    for (std::uint32_t entry = 0; entry < LargeEntries; ++entry) {
+        const auto& captured = valid.snapshot.tables.at(0);
+        const auto index = captured.codes[entry];
+        require(index < captured.words.size() && captured.words[index].dwords == heap[entry], "capture benchmark: a regular column changed its descriptor words");
+    }
+    std::cout << "table_column_bounds full_snapshot_records=" << LargeEntries << " descriptor_words=equal\n";
 
     FillTableSrt(guest, heap.data(), 32u, UniqueEntries);
     const auto unique = checkRepeated("unique-13k", wholeRequest, wholeInfo, heapBegin, heapEnd, 0u);
@@ -4582,7 +4618,7 @@ void verifyImageTableCaptureBenchmark() {
     const auto pointerZero = runPointer(0u);
     report("pointer-boundary-zero-65k", 0u, pointerZero);
     require(pointerZero.snapshot.tables.at(0).base == pointerBase && pointerZero.snapshot.tables.at(0).keys == LargeEntries && pointerZero.snapshot.tables.at(0).words.size() == 1u && pointerZero.snapshot.tables.at(0).outside && pointerZero.resolved.elements.empty() && pointerZero.resolved.faults == 1u, "capture benchmark: pointer table all-zero case changed base, key count, distinct values, or outside fault");
-    for (std::uint32_t iteration = 1; iteration < Repeat; iteration++) {
+    for (std::uint32_t iteration = 1; iteration < repeat; iteration++) {
         const auto sample = runPointer(0u);
         require(sample.snapshot == pointerZero.snapshot && sameResolved(sample.resolved, pointerZero.resolved), "capture benchmark: pointer zero snapshot changed");
         report("pointer-boundary-zero-65k", iteration, sample);
@@ -4595,7 +4631,7 @@ void verifyImageTableCaptureBenchmark() {
     require(pointerUnmappedCount == 129u && pointerUnmapped.snapshot.tables.at(0).codes[124] == 0u && pointerUnmapped.snapshot.tables.at(0).codes[125] == pointerUnmappedCode && pointerUnmapped.snapshot.tables.at(0).codes[253] == pointerUnmappedCode && pointerUnmapped.snapshot.tables.at(0).codes[254] == 0u, "capture benchmark: address-table page boundary did not mark exactly records 125 through 253 Unmapped");
     const auto pointerMappings = TableCodes(pointerUnmapped.resolved.map, 0u);
     require(pointerUnmapped.resolved.poison.size() == 3u && pointerMappings[125] == pointerMappings[253] && pointerMappings[125] == Abi::PoisonCode(2u), "capture benchmark: address-table boundary poison mapping was not shared");
-    for (std::uint32_t iteration = 1; iteration < Repeat; iteration++) {
+    for (std::uint32_t iteration = 1; iteration < repeat; iteration++) {
         const auto sample = runPointer(pointerUnmappedPage);
         require(sample.snapshot == pointerUnmapped.snapshot && sameResolved(sample.resolved, pointerUnmapped.resolved), "capture benchmark: pointer unmapped snapshot changed");
         report("pointer-boundary-unmapped-65k", iteration, sample);
@@ -4622,7 +4658,7 @@ void verifyImageTableCaptureBenchmark() {
         const auto record = pointerValidCodes[entry];
         require((record & Abi::PoisonFlag) == 0u && pointerValid.resolved.map.at(record + Abi::ImageRecordElement) == entry % UniqueEntries, "capture benchmark: the resolved address-table map does not preserve descriptor reuse");
     }
-    for (std::uint32_t iteration = 1; iteration < Repeat; iteration++) {
+    for (std::uint32_t iteration = 1; iteration < repeat; iteration++) {
         const auto sample = runPointer(0u);
         require(sample.snapshot == pointerValid.snapshot && sameResolved(sample.resolved, pointerValid.resolved), "capture benchmark: fully mapped address-table snapshot, map, or read ranges changed");
         report("pointer-valid-65k", iteration, sample);
@@ -10682,6 +10718,10 @@ int main(int argc, char** argv) {
             verifyImageTableCaptureBenchmark();
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--table-column-bounds-benchmark") {
+            verifyImageTableCaptureBenchmark(600u);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--image-table-populate-mask-benchmark") {
             verifyImageTablePopulateSamplerMasks();
             return 0;
@@ -10691,6 +10731,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--bindless") {
+            verifyWholeBufferColumnBounds();
             verifyImageTableKeys();
             verifyImageTables();
             verifyImageTableBulkReads();
@@ -10715,6 +10756,13 @@ int main(int argc, char** argv) {
             verifyWaterfallImageTable();
             verifySplitWaterfallImageTable();
             std::cout << "Image table keys, maps, records and registration passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--table-column-bounds") {
+            verifyWholeBufferColumnBounds();
+            verifyImageTableBulkReads();
+            verifyImageTableReadBufferLease();
+            std::cout << "table_column_bounds exact_bulk_reads=1 unmapped_poison=1 no_extra_bytes=1 nested_failure_recovery=1\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--table-snapshot-reuse") {
