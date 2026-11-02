@@ -192,6 +192,10 @@ private:
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
+inline VkPipelineCreateFlags2CreateInfoKHR DescriptorHeapFlags(VkPipelineCreateFlags2KHR flags = 0, const void* next = nullptr) {
+    return {VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR, next, flags | VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT};
+}
+
 struct Context {
     VkDevice device;
     VkPhysicalDevice physical;
