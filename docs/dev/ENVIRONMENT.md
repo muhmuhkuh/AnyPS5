@@ -77,6 +77,12 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 
 | Name | Kind | Source | Default | Description |
 |------|------|--------|---------|-------------|
+| `APS5_COMMIT_RESERVE_MIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/BufferPool.cpp` | 0 | on Windows, attempts to release pooled and cached memory before an allocation would leave less commit headroom than this many MiB |
+| `APS5_IMAGE_BACKING` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | records image backing and ownership diagnostics |
+| `APS5_SNAPSHOT_BACKING` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | reports sampled texture snapshot backing and reuse diagnostics |
+| `APS5_TEST_AGC_DRIVER_PATH` | string | `core/libs/prx/libSceAgcDriver/tests/Recorder.cpp` |  | expected loaded AGC driver path for the staging lifetime test |
+| `APS5_TEST_EXPECT_PRESSURE_RELEASE` | presence | `core/libs/prx/libSceAgcDriver/tests/Recorder.cpp` |  | requires the staging lifetime test to observe pressure releasing its completed allocation |
+| `APS5_TEST_STAGING_LIFETIME` | presence | `core/libs/prx/libSceAgcDriver/tests/Recorder.cpp` |  | selects the staging lifetime case in the BDA staging test |
 | `ANYPS5_GPU` | string | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | restricts physical device selection to device names containing this case-insensitive substring |
 | `ANYPS5_HOST_REPORT` | string | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` | 0 | prints the host report to stderr once when the presenting device is chosen: 1 prints it; 0, empty or unset prints nothing, and any other value stops the start with an error naming the variable |
 | `ANYPS5_OVERLAY` | string | `core/libs/prx/libSceAgcDriver/Execution/src/PerformanceOverlay.cpp` | 0 | the performance overlay's page at start: 1 the overlay, 2 its detailed page; 0 or unset hides it, and any other value is refused |
