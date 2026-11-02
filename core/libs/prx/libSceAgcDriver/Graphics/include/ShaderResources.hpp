@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -72,13 +73,8 @@ std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, con
 bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const StorageTexture* except);
 
 inline std::size_t HeapStageIndex(ShaderRecompiler::ShaderStage stage) {
-    namespace Abi = ShaderRecompiler::RuntimeAbi;
-    switch (stage) {
-    case ShaderRecompiler::ShaderStage::Fragment: return static_cast<std::size_t>(Abi::Stage::Fragment);
-    case ShaderRecompiler::ShaderStage::TessellationControl: return static_cast<std::size_t>(Abi::Stage::TessellationControl);
-    case ShaderRecompiler::ShaderStage::TessellationEvaluation: return static_cast<std::size_t>(Abi::Stage::TessellationEvaluation);
-    default: return static_cast<std::size_t>(Abi::Stage::Main);
-    }
+    using ShaderRecompiler::ShaderStage;
+    return static_cast<std::size_t>(ShaderRecompiler::RuntimeAbi::StageGroup(stage == ShaderStage::Fragment, stage == ShaderStage::TessellationControl, stage == ShaderStage::TessellationEvaluation));
 }
 
 struct PipelineSetLayouts {
@@ -165,6 +161,7 @@ struct ImageTableReuseCounts {
     std::uint64_t writesMade = 0;
 };
 ImageTableReuseCounts ImageTableReuses();
+std::uint64_t SampledTexturesCleared();
 std::uint64_t SampledLookupKeyScans();
 
 struct PresyncSurface {
@@ -174,7 +171,6 @@ struct PresyncSurface {
 };
 
 class ShaderResources {
-    friend struct StagingLifetimeFixture;
 public:
     ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes);
     ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots = {});
@@ -184,7 +180,7 @@ public:
     // then no other member may be used. `compute` and `snapshots` must outlive Complete(). An
     // address-based shader (BDA tables) builds entirely in Complete(): its lease acquisition
     // reconciles imports and refreshes mirrors, which needs the lock.
-    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0);
+    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
     void Complete();
     bool Completed() const { return completed; }
     ~ShaderResources();
@@ -253,6 +249,11 @@ public:
     bool NeedsCompletion() const { return (bda != nullptr && faultChecks) || guestMemory.HasCopiedWrites(); }
     // Whether a written buffer was copied (its results reach guest memory by the CPU write-back).
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
+    bool HasGpuCopies() const { return guestMemory.HasGpuCopies(); }
+    bool HasHostGpuCopies() const { return guestMemory.HasHostGpuCopies(); }
+    const void* MemoryOwner() const { return &guestMemory; }
+    void CopyBacksAfterRun(std::shared_ptr<ShaderResources> self) { afterRunSelf = std::move(self); }
+    void RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const;
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool SpaceReuse() const { return spaceReuse; }
     static bool SpaceReuseDisabled();
@@ -308,10 +309,6 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
-    std::shared_ptr<BufferPool> IdleStagingPool(VkDevice device) const {
-        if (context.device != device || !completed || !reusable || NeedsCompletion() || usesBda || !textures.empty() || !storageTextures.empty() || TableElements() != 0) return {};
-        return guestMemory.IdleStagingPool();
-    }
     void KeepStorageImageBytes(Recorder& recorder) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
@@ -550,7 +547,8 @@ private:
     void forgetDeferredInputs();
     void release() noexcept;
     void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
-    VkDescriptorBufferInfo descriptor(Allocation& allocation);
+    VkDescriptorBufferInfo descriptor(Allocation& allocation) { return descriptor(allocation, allocation.adjustment); }
+    VkDescriptorBufferInfo descriptor(const Allocation& allocation, std::uint32_t& adjustment) const;
     VkDescriptorBufferInfo wholeDwordRange(VkDescriptorBufferInfo info) const;
     void noteReusable();
     void reportDescriptorCaches() const;
@@ -613,6 +611,7 @@ private:
     Context context;
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;
+    std::shared_ptr<ShaderResources> afterRunSelf;
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;
@@ -662,8 +661,8 @@ private:
     VkImageView heapSampledView(std::size_t index) const;
     VkImageView heapStorageView(std::size_t index, std::uint32_t binding) const;
     VkImageView heapMultisampleStorageView(std::size_t index) const;
+    const HeapSlotOwner* heapMultisampleStorageOwner(std::size_t index) const;
     void appendHeapSlotKey(VkShaderStageFlags stageBit, std::vector<std::uintptr_t>& key) const;
-    static bool heapSlotsCurrent(const BindlessHeap& heap, const HeapStageState& state);
     void takeHeapSlots(BindlessHeap& heap, HeapStageState& state, VkShaderStageFlags stageBit, std::span<const std::uintptr_t> key);
     static void noteHeapSlotGenerations(const BindlessHeap& heap, HeapStageState& state);
     void verifyHeapSlots(const BindlessHeap& heap, const HeapStageState& state, VkShaderStageFlags stageBit) const;
@@ -707,12 +706,13 @@ private:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writeOnlyRanges;
     bool drawBuild = false;
     std::uint64_t dispatchThreads = 0;
+    std::optional<std::pair<std::uint64_t, std::size_t>> htileClear;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<bool> textureFirstLayer;
     std::vector<bool> textureBaseLevel;
     std::vector<bool> textureSrgb;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
-    std::vector<VkImageView> multisampleStorageViews;
+    std::vector<MultisampleStorage> multisampleStorage;
     std::vector<std::uint32_t> storageMips;
     std::vector<std::uint64_t> storageKeys;
     std::vector<bool> storageFirstLayer;
@@ -744,6 +744,7 @@ private:
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
+    bool importsReconcilable = false;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
     std::uint64_t dataWordsHash = 14695981039346656037ull;
     void rehashDataWords();
@@ -809,8 +810,6 @@ public:
     void Remove(const Key& key, const ShaderResources* object = nullptr);
     void RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     bool TryRemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
-    bool TryReleaseTexture(const std::shared_ptr<Texture>& texture, std::vector<std::shared_ptr<ShaderResources>>& retired);
-    std::shared_ptr<ShaderResources> TryTakeIdleStaged(VkDevice device);
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
@@ -861,8 +860,6 @@ private:
     mutable AgcDriver::Mutex mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
-    std::unordered_map<const Texture*, std::vector<std::pair<decltype(entries)::iterator, long>>> textureOwners;
-    bool textureOwnersValid = false;
     std::size_t capacity = 0;
     bool fixedCapacity = false;
     std::list<std::size_t> evictedOrder;

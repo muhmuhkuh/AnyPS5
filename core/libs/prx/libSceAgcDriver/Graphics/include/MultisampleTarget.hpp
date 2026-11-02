@@ -18,6 +18,13 @@
 
 namespace AgcDriver::Graphics {
 
+class HeapSlotOwner;
+
+struct MultisampleStorage {
+    VkImageView view = VK_NULL_HANDLE;
+    const HeapSlotOwner* owner = nullptr;
+};
+
 class StorageTexture;
 class Texture;
 struct GuestTextureResource;
@@ -48,6 +55,8 @@ public:
     void NoteFill(std::uint64_t fillAddress, std::size_t fillBytes, std::uint32_t pattern);
     std::optional<std::uint32_t> TakeFill();
     void Discard();
+    std::optional<std::uint32_t> Pending() const { return filled; }
+    const std::string& Refusal() const { return refusal; }
 
 private:
     std::uint64_t address = 0;
@@ -55,6 +64,20 @@ private:
     std::optional<std::uint32_t> filled;
     std::string refusal;
 };
+
+enum class MultisampleColorContent { Unknown, Fill, FastClear, Clear, Drawn };
+
+struct MultisampleColorAlias {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint32_t samples = 0;
+    MultisampleColorContent newest = MultisampleColorContent::Unknown;
+    std::optional<VkClearColorValue> value;
+    std::optional<std::uint8_t> byte;
+};
+
+std::optional<MultisampleColorAlias> MultisampleColorTargetOver(std::uint64_t address, std::size_t bytes);
 
 std::uint64_t MultisampledColorBytes(const ColorTarget& target);
 std::size_t MultisampledDccBytes(const ColorTarget& target);
@@ -75,7 +98,7 @@ VkImageView MultisampleTargetView(const Context& context, const ColorTarget& tar
 VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target, std::shared_ptr<void>& owner, VkImage* image = nullptr);
 void KeepMultisampleTarget_nid_no_patch(const std::shared_ptr<void>& owner);
 void MaterializeMultisampleTargetClear(const Context& context, const ColorTarget& target);
-VkImageView MultisampleTargetStorageView(const Context& context, const GuestTextureResource& resource, bool uintStorage = false);
+MultisampleStorage MultisampleTargetStorageView(const Context& context, const GuestTextureResource& resource, bool uintStorage = false);
 bool MultisampleTargetStorable(const Context& context, const ColorTarget& target);
 void ResolveMultisampleTarget(const Context& context, const ColorTarget& source, StorageTexture& destination, VkImageView destinationView);
 bool MultisampledColorFillAbsorbs(std::uint64_t address, std::size_t bytes, std::uint32_t pattern);

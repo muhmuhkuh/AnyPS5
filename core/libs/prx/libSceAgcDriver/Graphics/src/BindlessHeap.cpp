@@ -1,29 +1,28 @@
 #include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
-#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DescriptorHeapObjects.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
-#include "prx/libc/include/HostThreadLocal.hpp"
 #include "Recompiler.hpp"
 #include "RuntimeAbi.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <spirv/unified1/spirv.hpp>
 
 namespace AgcDriver::Graphics {
 
@@ -52,16 +51,29 @@ namespace {
 
 namespace Abi = ShaderRecompiler::RuntimeAbi;
 
-void check(VkResult result, const char* what) {
-    if (result != VK_SUCCESS)
-        throw std::runtime_error(std::string("AGC bindless heap: ") + what + " failed: " + std::to_string(static_cast<int>(result)));
+constexpr std::size_t RingSpanAlignment = 16u;
+
+bool pipelineStats() {
+    static const bool enabled = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return enabled;
 }
 
-std::atomic<std::uint64_t> spansWrittenWindow{0};
-std::atomic<std::uint64_t> imageEncodesWindow{0};
-std::atomic<std::uint64_t> imageCopiesWindow{0};
-std::atomic<std::uint64_t> spansKeptWindow{0};
-std::atomic<std::uint64_t> spansExpiredWindow{0};
+bool isSampledKind(std::uint32_t kind) {
+    return kind >= Abi::FirstImageBinding && kind < Abi::FirstStorageImageBinding;
+}
+
+bool isImageKind(std::uint32_t kind) {
+    return kind >= Abi::FirstImageBinding && kind < BindlessHeap::SamplerKind;
+}
+
+std::size_t chunkOf(std::size_t offset) {
+    return offset / BindlessHeap::RingChunkBytes;
+}
+
+std::size_t lastChunkOf(std::size_t offset, std::size_t bytes) {
+    return chunkOf(offset + std::max<std::size_t>(bytes, 1u) - 1u);
+}
+
 std::atomic<std::uint64_t> heapComputeStages{0};
 std::atomic<bool> descriptorHeapDevice{false};
 std::atomic<std::uint64_t> imageTableBuilds{0};
@@ -113,10 +125,6 @@ void SetDescriptorHeapDevice(bool available) {
 
 bool DescriptorHeapEnabled() {
     return GpuHeapEnabled() && descriptorHeapDevice.load(std::memory_order_relaxed);
-}
-
-bool HeapComputeEnabled() {
-    return DescriptorHeapEnabled();
 }
 
 namespace {
@@ -233,33 +241,32 @@ BindlessHeap::BindlessHeap(const Context& context) : context(context) {
         ringHeapOffset = heapRing.offset;
         ringBytes = heapRing.bytes;
         ringData = resourceHeap->Bytes().data() + ringHeapOffset;
-        ringAlignment = static_cast<std::uint32_t>(std::max<VkDeviceSize>({context.limits.minStorageBufferOffsetAlignment, context.limits.minUniformBufferOffsetAlignment, 16}));
+        ringAlignment = static_cast<std::uint32_t>(std::max<VkDeviceSize>({context.limits.minStorageBufferOffsetAlignment, context.limits.minUniformBufferOffsetAlignment, RingSpanAlignment}));
     } else {
         ring = makeBuffer(RingBytes, ringUsage, true);
         ringData = ring->Bytes().data();
-        ringAlignment = static_cast<std::uint32_t>(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16));
+        ringAlignment = static_cast<std::uint32_t>(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, RingSpanAlignment));
     }
     ringChunks.resize(ringBytes / RingChunkBytes);
-    nextTextureSlot = SamplerKind;
     slotCap = configuredSlotCap();
+    imagePool.next = SamplerKind;
+    imagePool.limit = slotCap;
+    samplerPool.limit = Abi::GpuSamplerHeapSlots;
 }
-
-BindlessHeap::~BindlessHeap() = default;
 
 namespace {
 
-struct SweptStorageTag {};
+constexpr std::uint32_t ImageSlotMargin = 1024u;
+constexpr std::uint32_t SamplerSlotMargin = Abi::GpuSamplerHeapSlots / 4u;
+std::atomic<std::uint32_t> refusedHeaps{0};
 
-std::vector<std::shared_ptr<void>>& sweptStorage() {
-    return HostThreadLocal<std::vector<std::shared_ptr<void>>, SweptStorageTag>();
 }
 
-struct SweptStorageRelease {
-    ~SweptStorageRelease() {
-        auto released = std::move(sweptStorage());
-        sweptStorage().clear();
-    }
-};
+BindlessHeap::~BindlessHeap() {
+    if (refused) refusedHeaps.fetch_sub(1, std::memory_order_relaxed);
+}
+
+namespace {
 
 std::mutex& heapsMutex() {
     static auto& mutex = *new std::mutex();
@@ -282,8 +289,7 @@ BindlessHeap& BindlessHeap::For(const Context& context) {
         std::uint64_t epoch = ~std::uint64_t{0};
     };
     thread_local Cached cached;
-    const bool trims = CommitTrims();
-    if (trims && cached.heap != nullptr && cached.device == context.device && cached.epoch == heapsEpoch.load(std::memory_order_acquire)) {
+    if (cached.heap != nullptr && cached.device == context.device && cached.epoch == heapsEpoch.load(std::memory_order_acquire)) {
         return *cached.heap;
     }
     std::lock_guard lock(heapsMutex());
@@ -292,7 +298,7 @@ BindlessHeap& BindlessHeap::For(const Context& context) {
         heap = std::make_unique<BindlessHeap>(context);
         heapsEpoch.fetch_add(1, std::memory_order_acq_rel);
     }
-    if (trims) cached = {context.device, heap.get(), heapsEpoch.load(std::memory_order_acquire)};
+    cached = {context.device, heap.get(), heapsEpoch.load(std::memory_order_acquire)};
     return *heap;
 }
 
@@ -314,114 +320,71 @@ BindlessHeap* BindlessHeap::Existing(const Context& context) {
     return found == heaps().end() ? nullptr : found->second.get();
 }
 
-std::optional<std::uint32_t> BindlessHeap::TextureSlot(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view,
-                                                       VkImageLayout layout) {
-    const bool sampledKind = kind >= Abi::FirstImageBinding && kind < Abi::FirstStorageImageBinding;
-    if (!sampledKind || texture == nullptr || view == VK_NULL_HANDLE)
-        throw std::runtime_error("AGC bindless heap: invalid texture slot request");
-    std::vector<std::shared_ptr<Texture>> dropped;
-    SweptStorageRelease swept;
+std::optional<std::uint32_t> BindlessHeap::TextureSlot(std::uint32_t kind, Texture* texture, VkImageView view, VkImageLayout layout) {
+    Require(isSampledKind(kind) && texture != nullptr && view != VK_NULL_HANDLE, "bindless heap: invalid texture slot request");
+    const HeapSlotOwner* owner = texture;
+    return imageSlot(kind, owner, view, layout, texture);
+}
+
+std::optional<std::uint32_t> BindlessHeap::StorageSlot(std::uint32_t kind, const HeapSlotOwner* owner, VkImageView view) {
+    Require(Abi::GpuHeapStorageKind(kind) && owner != nullptr && view != VK_NULL_HANDLE, "bindless heap: invalid storage slot request");
+    return imageSlot(kind, owner, view, VK_IMAGE_LAYOUT_GENERAL, nullptr);
+}
+
+std::optional<std::uint32_t> BindlessHeap::ViewSlot(std::uint32_t kind, const HeapSlotOwner* owner, VkImageView view) {
+    Require(isImageKind(kind) && owner != nullptr && view != VK_NULL_HANDLE, "bindless heap: invalid view slot request");
+    return imageSlot(kind, owner, view, VK_IMAGE_LAYOUT_GENERAL, nullptr);
+}
+
+std::optional<std::uint32_t> BindlessHeap::imageSlot(std::uint32_t kind, const HeapSlotOwner* owner, VkImageView view, VkImageLayout layout, Texture* texture) {
     std::lock_guard lock(mutex);
-    const TextureKey key{kind, texture.get(), view, layout};
-    if (const auto found = textureSlots.find(key); found != textureSlots.end()) return found->second;
-    if (++slotRequests % 1024u == 0u) NoteSweepDue();
-    const auto slot = takeOrSweepLocked(dropped);
+    const ImageSlotKey key{kind, owner, view, layout};
+    if (const auto found = imageSlots.find(key); found != imageSlots.end()) return found->second;
+    bool reused = false;
+    const auto slot = imagePool.Take(reused);
     if (!slot) return std::nullopt;
+    if (reused) ++counts.slotsReused;
     writeImageSlot(kind, *slot, view, layout);
-    auto& owner = claimSlotLocked(key, *slot);
-    owner.texture = texture;
-    texture->AddHeapHold();
-    noteTakenLocked(dropped);
-    if (const auto& source = texture->SharedStorageSource(); source != nullptr && source->LeftCache()) NoteStorageEvicted();
+    claimSlotLocked(key, *slot).texture = texture;
+    owner->heapSlotted.store(true, std::memory_order_release);
+    noteTakenLocked();
     return slot;
 }
 
-std::optional<std::uint32_t> BindlessHeap::StorageSlot(std::uint32_t kind, std::shared_ptr<void> owner, VkImageView view) {
-    return takeStorageSlot(kind, std::move(owner), view, nullptr);
-}
-
-std::optional<std::uint32_t> BindlessHeap::StorageSlot(std::uint32_t kind, const std::shared_ptr<StorageTexture>& image, VkImageView view) {
-    return takeStorageSlot(kind, image, view, image.get());
-}
-
-std::optional<std::uint32_t> BindlessHeap::takeStorageSlot(std::uint32_t kind, std::shared_ptr<void> owner, VkImageView view, const StorageTexture* image) {
-    if (!Abi::GpuHeapStorageKind(kind) || owner == nullptr || view == VK_NULL_HANDLE)
-        throw std::runtime_error("AGC bindless heap: invalid storage slot request");
-    std::vector<std::shared_ptr<Texture>> dropped;
-    SweptStorageRelease swept;
+void BindlessHeap::ReleaseSlots(const HeapSlotOwner* owner) {
     std::lock_guard lock(mutex);
-    const TextureKey key{kind, owner.get(), view, VK_IMAGE_LAYOUT_GENERAL};
-    if (const auto found = textureSlots.find(key); found != textureSlots.end()) return found->second;
-    if (++slotRequests % 1024u == 0u) NoteSweepDue();
-    const auto slot = takeOrSweepLocked(dropped);
-    if (!slot) return std::nullopt;
-    noteTakenLocked(dropped);
-    writeImageSlot(kind, *slot, view, VK_IMAGE_LAYOUT_GENERAL);
-    auto& claimed = claimSlotLocked(key, *slot);
-    claimed.storage = std::move(owner);
-    claimed.image = image;
-    storageSlots[key.texture].push_back(*slot);
-    if (image != nullptr && image->LeftCache()) NoteStorageEvicted();
-    return slot;
-}
-
-std::optional<std::uint32_t> BindlessHeap::ViewSlot(std::uint32_t kind, const void* owner, VkImageView view) {
-    const bool imageKind = kind >= Abi::FirstImageBinding && kind < SamplerKind;
-    if (!imageKind || owner == nullptr || view == VK_NULL_HANDLE) throw std::runtime_error("AGC bindless heap: invalid view slot request");
-    std::vector<std::shared_ptr<Texture>> dropped;
-    SweptStorageRelease swept;
-    std::lock_guard lock(mutex);
-    const TextureKey key{kind, owner, view, VK_IMAGE_LAYOUT_GENERAL};
-    if (const auto found = textureSlots.find(key); found != textureSlots.end()) return found->second;
-    const auto slot = takeOrSweepLocked(dropped);
-    if (!slot) return std::nullopt;
-    noteTakenLocked(dropped);
-    writeImageSlot(kind, *slot, view, VK_IMAGE_LAYOUT_GENERAL);
-    claimSlotLocked(key, *slot);
-    viewSlots[owner].push_back(*slot);
-    return slot;
-}
-
-void BindlessHeap::ReleaseViewSlots(const void* owner) {
-    std::lock_guard lock(mutex);
-    const auto found = viewSlots.find(owner);
-    if (found == viewSlots.end()) return;
-    for (const auto slot : found->second) freeSlotLocked(slot);
-    slotSerial.fetch_add(1, std::memory_order_release);
-    viewSlots.erase(found);
-    if (NearlyFull()) NoteSweepDue();
-}
-
-std::optional<std::uint32_t> BindlessHeap::takeOrSweepLocked(std::vector<std::shared_ptr<Texture>>& dropped) {
-    auto slot = takeSlotLocked();
-    if (!slot) {
-        sweepLocked(dropped);
-        slot = takeSlotLocked();
+    bool released = false;
+    if (const auto found = ownerSlots.find(owner); found != ownerSlots.end()) {
+        const auto slots = std::move(found->second);
+        ownerSlots.erase(found);
+        for (const auto slot : slots) freeSlotLocked(slot);
+        released = true;
     }
-    if (!slot) ++counts.full;
-    return slot;
+    if (const auto found = samplerSlots.find(owner); found != samplerSlots.end()) {
+        samplerPool.Free(found->second);
+        samplerSlots.erase(found);
+        ++counts.slotsFreed;
+        released = true;
+    }
+    if (!released) return;
+    slotSerial.fetch_add(1, std::memory_order_release);
+    noteReleasedLocked();
 }
 
-BindlessHeap::SlotOwner& BindlessHeap::claimSlotLocked(const TextureKey& key, std::uint32_t slot) {
-    textureSlots.emplace(key, slot);
+BindlessHeap::SlotOwner& BindlessHeap::claimSlotLocked(const ImageSlotKey& key, std::uint32_t slot) {
+    imageSlots.emplace(key, slot);
+    ownerSlots[key.owner].push_back(slot);
     if (owners.size() <= slot) owners.resize(slot + 1u);
     owners[slot].key = key;
-    ++counts.textures;
     return owners[slot];
 }
 
 void BindlessHeap::freeSlotLocked(std::uint32_t slot) {
     auto& owner = owners[slot];
-    if (const auto found = storageSlots.find(owner.key.texture); found != storageSlots.end()) {
-        auto& slots = found->second;
-        if (const auto at = std::find(slots.begin(), slots.end(), slot); at != slots.end()) slots.erase(at);
-        if (slots.empty()) storageSlots.erase(found);
-    }
-    textureSlots.erase(owner.key);
-    owner.image = nullptr;
+    imageSlots.erase(owner.key);
+    owner.texture = nullptr;
     owner.key = {};
-    ++owner.generation;
-    freeSlots.push_back(slot);
+    imagePool.Free(slot);
     ++counts.slotsFreed;
 }
 
@@ -429,258 +392,76 @@ const BindlessHeap::SlotOwner* BindlessHeap::ownerLocked(std::uint32_t slot) con
     return slot < owners.size() ? &owners[slot] : nullptr;
 }
 
-std::optional<std::uint32_t> BindlessHeap::takeSlotLocked() {
-    if (!freeSlots.empty()) {
-        const auto slot = freeSlots.back();
-        freeSlots.pop_back();
-        ++counts.slotsReused;
+std::optional<std::uint32_t> BindlessHeap::SlotPool::Take(bool& reused) {
+    reused = false;
+    if (!free.empty()) {
+        const auto slot = free.back();
+        free.pop_back();
+        reused = true;
         return slot;
     }
-    if (nextTextureSlot >= slotCap) return std::nullopt;
-    return nextTextureSlot++;
+    if (next >= limit) return std::nullopt;
+    const auto slot = next++;
+    if (generations.size() <= slot) generations.resize(static_cast<std::size_t>(slot) + 1u, 0u);
+    return slot;
 }
 
-void BindlessHeap::sweepLocked(std::vector<std::shared_ptr<Texture>>& dropped) {
-    ++counts.sweeps;
-    const auto firstDropped = dropped.size();
-    for (std::uint32_t slot = SamplerKind; slot < owners.size(); ++slot) {
-        auto& owner = owners[slot];
-        if (owner.storage != nullptr) {
-            if (!heldOnlyHereLocked(owner.key.texture, owner.storage.use_count())) continue;
-            dropStorageLocked(owner.key.texture, slot);
-            continue;
-        } else {
-            const bool heldElsewhere =
-                owner.texture == nullptr || owner.texture.use_count() > static_cast<long>(owner.texture->HeapHolds());
-            if (heldElsewhere) continue;
-            dropped.push_back(std::move(owner.texture));
-        }
-        freeSlotLocked(slot);
-        slotSerial.fetch_add(1, std::memory_order_release);
-    }
-    for (auto index = firstDropped; index < dropped.size(); ++index) dropped[index]->DropHeapHold();
+void BindlessHeap::SlotPool::Free(std::uint32_t slot) {
+    ++generations[slot];
+    free.push_back(slot);
 }
 
-bool BindlessHeap::heldOnlyHereLocked(const void* owner, long uses) const {
-    const auto found = storageSlots.find(owner);
-    const auto slots = found != storageSlots.end() ? static_cast<long>(found->second.size()) : 1l;
-    return uses <= slots;
+std::size_t BindlessHeap::SlotPool::Unused() const {
+    return (next < limit ? limit - next : 0u) + free.size();
 }
 
-bool BindlessHeap::releaseUncachedLocked(std::vector<std::shared_ptr<Texture>>& dropped, bool storagePhase) {
-    bool heldElsewhere = false;
-    const auto firstDropped = dropped.size();
-    std::vector<std::pair<const void*, std::uint32_t>> images;
-    for (std::uint32_t slot = SamplerKind; slot < owners.size(); ++slot) {
-        auto& owner = owners[slot];
-        if (owner.storage != nullptr) {
-            if (!storagePhase) continue;
-            if (owner.image == nullptr || !owner.image->LeftCache()) continue;
-            const auto found = storageSlots.find(owner.key.texture);
-            if (found == storageSlots.end() || found->second.front() != slot) continue;
-            if (!heldOnlyHereLocked(owner.key.texture, owner.storage.use_count())) {
-                heldElsewhere = true;
-                continue;
-            }
-            images.emplace_back(owner.key.texture, slot);
-            continue;
-        }
-        if (storagePhase || owner.texture == nullptr) continue;
-        const auto& source = owner.texture->SharedStorageSource();
-        if (source == nullptr || !source->LeftCache()) continue;
-        if (owner.texture.use_count() > static_cast<long>(owner.texture->HeapHolds())) {
-            heldElsewhere = true;
-            continue;
-        }
-        heldElsewhere = true;
-        dropped.push_back(std::move(owner.texture));
-        freeSlotLocked(slot);
-        slotSerial.fetch_add(1, std::memory_order_release);
-    }
-    for (auto index = firstDropped; index < dropped.size(); ++index) dropped[index]->DropHeapHold();
-    for (const auto& [image, slot] : images) dropStorageLocked(image, slot);
-    return heldElsewhere;
-}
-
-void BindlessHeap::dropStorageLocked(const void* image, std::uint32_t slot) {
-    std::vector<std::uint32_t> slots{slot};
-    if (const auto found = storageSlots.find(image); found != storageSlots.end()) slots = found->second;
-    for (const auto held : slots) {
-        sweptStorage().push_back(std::move(owners[held].storage));
-        freeSlotLocked(held);
-    }
-    slotSerial.fetch_add(1, std::memory_order_release);
-}
-
-void BindlessHeap::sweepSamplersLocked(std::vector<std::shared_ptr<Sampler>>& dropped) {
-    for (std::uint32_t slot = 0; slot < heldSamplers.size(); ++slot) {
-        auto& held = heldSamplers[slot];
-        if (held == nullptr || held.use_count() != 1) continue;
-        samplerSlots.erase(held.get());
-        dropped.push_back(std::move(held));
-        ++samplerGenerations[slot];
-        slotSerial.fetch_add(1, std::memory_order_release);
-        freeSamplerSlots.push_back(slot);
-        ++counts.slotsFreed;
-    }
-}
-
-namespace {
-
-constexpr std::uint32_t ImageSlotMargin = 1024u;
-constexpr std::uint32_t SamplerSlotMargin = Abi::GpuSamplerHeapSlots / 4u;
-std::atomic<bool> nearlyFull{false};
-
-void noteNearlyFull(const char* what, std::uint32_t margin) {
-    if (!nearlyFull.exchange(true, std::memory_order_relaxed))
-        std::fprintf(stderr, "[gpu-heap] fewer than %u %s slots are free; draws and dispatches take the per-draw path until a sweep frees twice that many\n", margin, what);
-}
-
+std::uint32_t BindlessHeap::SlotPool::Generation(std::uint32_t slot) const {
+    return slot < generations.size() ? generations[slot] : 0u;
 }
 
 bool BindlessHeap::NearlyFull() {
-    return nearlyFull.load(std::memory_order_relaxed);
+    return refusedHeaps.load(std::memory_order_relaxed) != 0u;
 }
 
 std::uint32_t BindlessHeap::ImageSlotCapacity() {
     return configuredSlotCap() - SamplerKind;
 }
 
-namespace {
-
-std::atomic<bool> sweepDue{false};
-
-std::atomic<bool> uncachedPending{false};
-std::atomic<std::uint32_t> refusedSweepChecks{0};
-constexpr std::uint32_t RefusedSweepInterval = 64u;
-
-}
-
-void BindlessHeap::NoteSweepDue() {
-    sweepDue.store(true, std::memory_order_relaxed);
-}
-
-void BindlessHeap::NoteStorageEvicted() {
-    uncachedPending.store(true, std::memory_order_relaxed);
-}
-
-
-std::unordered_map<const StorageTexture*, std::size_t> BindlessHeap::StorageOwnerCounts() {
-    std::unordered_map<const StorageTexture*, std::size_t> result;
-    std::lock_guard heapsLock(heapsMutex());
-    for (const auto& [device, heap] : heaps()) {
-        if (heap == nullptr) continue;
-        std::lock_guard lock(heap->mutex);
-        for (const auto& owner : heap->owners) if (owner.storage != nullptr && owner.image != nullptr) ++result[owner.image];
-    }
-    return result;
-}
-
-std::uint64_t BindlessHeap::ReclaimStorageImages() {
-    GuestMemory::AssertGpuLockHeld("BindlessHeap::ReclaimStorageImages");
-    std::uint64_t bytes = 0;
-    SweptStorageRelease swept;
-    std::lock_guard heapsLock(heapsMutex());
-    for (auto& [device, heap] : heaps()) {
-        if (heap == nullptr) continue;
-        std::lock_guard lock(heap->mutex);
-        std::vector<std::pair<const void*, std::uint32_t>> retired;
-        for (std::uint32_t slot = SamplerKind; slot < heap->owners.size(); ++slot) {
-            const auto& owner = heap->owners[slot];
-            if (owner.storage == nullptr || owner.image == nullptr || !owner.image->LeftCache() || owner.image->Dirty()) continue;
-            const auto found = heap->storageSlots.find(owner.key.texture);
-            if (found == heap->storageSlots.end() || found->second.front() != slot || !heap->heldOnlyHereLocked(owner.key.texture, owner.storage.use_count())) continue;
-            retired.emplace_back(owner.key.texture, slot);
-        }
-        for (const auto& [identity, slot] : retired) {
-            const auto& owner = heap->owners[slot];
-            const auto allocated = owner.image->AllocationBytes();
-            bytes += allocated;
-            if (std::getenv("APS5_IMAGE_BACKING") != nullptr) {
-                static std::uint64_t count = 0, total = 0;
-                total += allocated;
-                if (++count <= 8 || count % 64 == 0) {
-                    ReportImageRetirement(owner.image->Image());
-                    std::fprintf(stderr, "[image-heap-reclaim] count=%llu bytes=%llu owner=%p image=%p allocation=%llu slots=%zu uses=%ld cached=%u dirty=%u\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(total), identity, static_cast<void*>(owner.image->Image()), static_cast<unsigned long long>(allocated), heap->storageSlots.at(identity).size(), owner.storage.use_count(), owner.image->Cached(), owner.image->Dirty());
-                }
-            }
-            heap->dropStorageLocked(identity, slot);
-        }
-    }
-    return bytes;
-}
-
-void BindlessHeap::SweepIfDue() {
-    const bool uncached = uncachedPending.load(std::memory_order_relaxed) && uncachedPending.exchange(false, std::memory_order_relaxed);
-    const bool due = sweepDue.load(std::memory_order_relaxed) && sweepDue.exchange(false, std::memory_order_relaxed);
-    const bool retry = !due && nearlyFull.load(std::memory_order_relaxed) &&
-                       refusedSweepChecks.fetch_add(1, std::memory_order_relaxed) % RefusedSweepInterval == RefusedSweepInterval - 1u;
-    if (!due && !retry && !uncached) return;
-    bool again = false;
-    bool room = true;
-    {
-        std::vector<std::shared_ptr<Texture>> dropped;
-        SweptStorageRelease swept;
-        std::vector<std::shared_ptr<Sampler>> droppedSamplers;
-        std::lock_guard heapsLock(heapsMutex());
-        for (auto& [device, heap] : heaps()) {
-            if (heap == nullptr) continue;
-            std::lock_guard lock(heap->mutex);
-            if (due || retry) {
-                heap->sweepLocked(dropped);
-                heap->sweepSamplersLocked(droppedSamplers);
-            }
-            if (uncached && heap->releaseUncachedLocked(dropped, false)) again = true;
-        }
-    }
-    {
-        std::vector<std::shared_ptr<Texture>> none;
-        SweptStorageRelease swept;
-        std::lock_guard heapsLock(heapsMutex());
-        for (auto& [device, heap] : heaps()) {
-            if (heap == nullptr) continue;
-            std::lock_guard lock(heap->mutex);
-            if (uncached && heap->releaseUncachedLocked(none, true)) again = true;
-            room = room && heap->roomLocked();
-        }
-    }
-    if (again) NoteStorageEvicted();
-    if (room && nearlyFull.exchange(false, std::memory_order_relaxed))
-        std::fprintf(stderr, "[gpu-heap] a sweep left twice the margin of slots free; draws take the heap again\n");
-}
-
 std::uint32_t BindlessHeap::imageMargin() const {
     return std::max(1u, std::min(ImageSlotMargin, (slotCap - SamplerKind) / 4u));
 }
 
-std::size_t BindlessHeap::unusedLocked() const {
-    return (nextTextureSlot < slotCap ? slotCap - nextTextureSlot : 0u) + freeSlots.size();
-}
-
 bool BindlessHeap::roomLocked() const {
-    if (unusedLocked() < 2u * static_cast<std::size_t>(imageMargin())) return false;
-    return Abi::GpuSamplerHeapSlots - heldSamplers.size() + freeSamplerSlots.size() >= 2u * SamplerSlotMargin;
+    if (imagePool.Unused() < 2u * static_cast<std::size_t>(imageMargin())) return false;
+    return samplerPool.Unused() >= 2u * SamplerSlotMargin;
 }
 
-void BindlessHeap::noteTakenLocked(std::vector<std::shared_ptr<Texture>>& dropped) {
-    if (nearlyFull.load(std::memory_order_relaxed)) return;
+void BindlessHeap::noteRefusedLocked(const char* what, std::uint32_t margin) {
+    if (refused) return;
+    refused = true;
+    refusedHeaps.fetch_add(1, std::memory_order_relaxed);
+    std::fprintf(stderr, "[gpu-heap] fewer than %u %s slots are free; draws and dispatches take the per-draw path until released slots leave twice that many free\n", margin, what);
+}
+
+void BindlessHeap::noteTakenLocked() {
     const auto margin = imageMargin();
-    if (unusedLocked() >= margin) return;
-    sweepLocked(dropped);
-    if (unusedLocked() < margin) noteNearlyFull("image", margin);
+    if (!refused && imagePool.Unused() < margin) noteRefusedLocked("image", margin);
 }
 
-void BindlessHeap::noteSamplerTakenLocked(std::vector<std::shared_ptr<Sampler>>& dropped) {
-    if (nearlyFull.load(std::memory_order_relaxed)) return;
-    const auto unused = [&] { return Abi::GpuSamplerHeapSlots - heldSamplers.size() + freeSamplerSlots.size(); };
-    if (unused() >= SamplerSlotMargin) return;
-    sweepSamplersLocked(dropped);
-    if (unused() < SamplerSlotMargin) noteNearlyFull("sampler", SamplerSlotMargin);
+void BindlessHeap::noteSamplerTakenLocked() {
+    if (!refused && samplerPool.Unused() < SamplerSlotMargin) noteRefusedLocked("sampler", SamplerSlotMargin);
+}
+
+void BindlessHeap::noteReleasedLocked() {
+    if (!refused || !roomLocked()) return;
+    refused = false;
+    refusedHeaps.fetch_sub(1, std::memory_order_relaxed);
+    std::fprintf(stderr, "[gpu-heap] released slots left twice the margin free; draws take the heap again\n");
 }
 
 std::uint32_t BindlessHeap::SamplerGeneration(std::uint32_t slot) const {
     std::lock_guard lock(mutex);
-    return slot < samplerGenerations.size() ? samplerGenerations[slot] : 0u;
+    return samplerPool.Generation(slot);
 }
 
 bool BindlessHeap::GenerationsCurrent(std::span<const std::vector<std::uint32_t>> slots, std::span<const std::uint32_t> slotGenerations,
@@ -690,40 +471,34 @@ bool BindlessHeap::GenerationsCurrent(std::span<const std::vector<std::uint32_t>
     std::size_t generation = 0;
     for (std::uint32_t kind = 0; kind < slots.size(); ++kind) {
         for (const auto slot : slots[kind]) {
-            const auto* owner = ownerLocked(slot);
-            const auto current = owner != nullptr ? owner->generation : 0u;
-            if (generation >= slotGenerations.size() || current != slotGenerations[generation++]) return false;
+            if (generation >= slotGenerations.size() || imagePool.Generation(slot) != slotGenerations[generation++]) return false;
         }
     }
-    const auto samplerGenerationOf = [&](std::uint32_t slot) {
-        return slot < this->samplerGenerations.size() ? this->samplerGenerations[slot] : 0u;
-    };
     for (std::size_t i = 0; i < samplerSlots.size(); ++i) {
-        if (i >= samplerGenerations.size() || samplerGenerationOf(samplerSlots[i]) != samplerGenerations[i]) return false;
+        if (i >= samplerGenerations.size() || samplerPool.Generation(samplerSlots[i]) != samplerGenerations[i]) return false;
     }
     return true;
 }
 
 std::uint32_t BindlessHeap::SlotGeneration(std::uint32_t slot) const {
     std::lock_guard lock(mutex);
-    const auto* owner = ownerLocked(slot);
-    return owner != nullptr ? owner->generation : 0u;
+    return imagePool.Generation(slot);
 }
 
 const Texture* BindlessHeap::SlotTexture(std::uint32_t kind, std::uint32_t slot) const {
     std::lock_guard lock(mutex);
     const auto* owner = ownerLocked(slot);
-    return owner != nullptr && owner->key.kind == kind ? owner->texture.get() : nullptr;
+    return owner != nullptr && owner->key.kind == kind ? owner->texture : nullptr;
 }
 
-bool BindlessHeap::SlotHoldsStorage(std::uint32_t kind, std::uint32_t slot, const void* owner, VkImageView view) const {
+bool BindlessHeap::SlotHoldsStorage(std::uint32_t kind, std::uint32_t slot, const HeapSlotOwner* owner, VkImageView view) const {
     std::lock_guard lock(mutex);
     const auto* held = ownerLocked(slot);
-    return held != nullptr && held->key == TextureKey{kind, owner, view, VK_IMAGE_LAYOUT_GENERAL};
+    return held != nullptr && held->key == ImageSlotKey{kind, owner, view, VK_IMAGE_LAYOUT_GENERAL};
 }
 
 std::uint32_t BindlessHeap::AbsentSlot(std::uint32_t kind, VkImageView view) {
-    if (kind < Abi::FirstImageBinding || kind >= SamplerKind) throw std::runtime_error("AGC bindless heap: invalid absent slot request");
+    Require(isImageKind(kind), "bindless heap: invalid absent slot request");
     std::lock_guard lock(mutex);
     if (absentSlots.contains(kind)) return kind;
     writeImageSlot(kind, kind, view, VK_IMAGE_LAYOUT_GENERAL);
@@ -732,29 +507,18 @@ std::uint32_t BindlessHeap::AbsentSlot(std::uint32_t kind, VkImageView view) {
 }
 
 std::optional<std::uint32_t> BindlessHeap::SamplerSlot(const std::shared_ptr<Sampler>& sampler) {
-    if (sampler == nullptr) throw std::runtime_error("AGC bindless heap: invalid sampler slot request");
-    std::vector<std::shared_ptr<Sampler>> dropped;
+    Require(sampler != nullptr, "bindless heap: invalid sampler slot request");
     std::lock_guard lock(mutex);
-    if (const auto found = samplerSlots.find(sampler.get()); found != samplerSlots.end()) return found->second;
-    if (freeSamplerSlots.empty()) sweepSamplersLocked(dropped);
-    std::uint32_t slot = 0;
-    if (!freeSamplerSlots.empty()) {
-        slot = freeSamplerSlots.back();
-        freeSamplerSlots.pop_back();
-        ++counts.slotsReused;
-    } else if (heldSamplers.size() < Abi::GpuSamplerHeapSlots) {
-        slot = static_cast<std::uint32_t>(heldSamplers.size());
-        heldSamplers.emplace_back();
-        samplerGenerations.push_back(0u);
-    } else {
-        ++counts.full;
-        return std::nullopt;
-    }
-    writeSamplerSlot(slot, sampler->Handle());
-    samplerSlots.emplace(sampler.get(), slot);
-    heldSamplers[slot] = sampler;
-    ++counts.samplers;
-    noteSamplerTakenLocked(dropped);
+    if (const auto found = samplerSlots.find(static_cast<const HeapSlotOwner*>(sampler.get())); found != samplerSlots.end()) return found->second;
+    bool reused = false;
+    const auto slot = samplerPool.Take(reused);
+    if (!slot) return std::nullopt;
+    if (reused) ++counts.slotsReused;
+    writeSamplerSlot(*slot, sampler->Handle());
+    const HeapSlotOwner* owner = sampler.get();
+    samplerSlots.emplace(owner, *slot);
+    owner->heapSlotted.store(true, std::memory_order_release);
+    noteSamplerTakenLocked();
     return slot;
 }
 
@@ -765,72 +529,63 @@ BindlessHeap::DataSpan BindlessHeap::Allocate(std::size_t words) {
 
 bool BindlessHeap::Held(const SpanMark& mark) {
     if (mark.entry == 0u || mark.words == 0u) return false;
-    const auto first = mark.offset / RingChunkBytes;
-    const auto last = (mark.offset + static_cast<std::size_t>(mark.words) * sizeof(std::uint32_t) - 1u) / RingChunkBytes;
-    if (first != last) return false;
+    const auto first = chunkOf(mark.offset);
+    const auto last = lastChunkOf(mark.offset, static_cast<std::size_t>(mark.words) * sizeof(std::uint32_t));
     std::lock_guard lock(mutex);
-    auto& chunk = ringChunks[first];
-    if (chunk.entries != mark.entry) {
-        ++counts.spansExpired;
-        spansExpiredWindow.fetch_add(1, std::memory_order_relaxed);
-        return false;
+    for (auto chunk = first; chunk <= last; ++chunk) {
+        if (ringChunks[chunk].entered > mark.entry) {
+            ++counts.spansExpired;
+            return false;
+        }
     }
-    chunk.open = true;
+    for (auto chunk = first; chunk <= last; ++chunk) ringChunks[chunk].open = true;
     ++counts.spansKept;
-    spansKeptWindow.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
 BindlessHeap::DataSpan BindlessHeap::Allocate(std::size_t words, SpanMark& mark) {
-    if (words > std::numeric_limits<std::uint32_t>::max() || words > (std::numeric_limits<std::size_t>::max() - 15u) / sizeof(std::uint32_t)) throw std::runtime_error("AGC bindless heap: shader data size overflows");
-    const auto bytes = ringInHeap ? (words * sizeof(std::uint32_t) + 15u) / 16u * 16u : words * sizeof(std::uint32_t);
-    if (bytes > ringBytes) throw std::runtime_error("AGC bindless heap: shader data exceeds the whole ring");
+    const auto bytes = ringInHeap ? alignUp(words * sizeof(std::uint32_t), RingSpanAlignment) : words * sizeof(std::uint32_t);
+    if (bytes > ringBytes / 2u) throw std::runtime_error("AGC bindless heap: per-draw data exceeds half the shader data ring");
     std::lock_guard lock(mutex);
-    auto offset = (ringCursor + ringAlignment - 1) / ringAlignment * ringAlignment;
-    if (offset + bytes > ringBytes) {
-        offset = 0;
-        ++counts.ringWraps;
-    }
-    const auto lastChunk = [&] { return (offset + std::max<std::size_t>(bytes, 1u) - 1u) / RingChunkBytes; };
+    auto offset = wrapRingOffset(alignUp(ringCursor, ringAlignment), bytes);
     const auto keptAhead = [&] {
-        for (auto chunk = offset / RingChunkBytes; chunk <= lastChunk(); ++chunk) {
-            if (chunk != ringChunk && ringChunks[chunk].open) return true;
+        for (auto chunk = chunkOf(offset); chunk <= lastChunkOf(offset, bytes); ++chunk) {
+            if (chunk == ringChunk ? offset < ringCursor : ringChunks[chunk].open) return true;
         }
         return false;
     };
     for (std::size_t skipped = 0; keptAhead(); ++skipped) {
         if (skipped == ringChunks.size()) throw std::runtime_error("AGC bindless heap: one batch's shader data exceeds its ring");
-        offset = (offset / RingChunkBytes + 1u) * RingChunkBytes;
-        if (offset + bytes > ringBytes) {
-            offset = 0;
-            ++counts.ringWraps;
-        }
+        offset = wrapRingOffset((chunkOf(offset) + 1u) * RingChunkBytes, bytes);
         ++counts.keptChunksSkipped;
     }
     ringCursor = offset + bytes;
-    for (auto chunk = offset / RingChunkBytes; chunk <= lastChunk(); ++chunk) enterChunk(ringChunks, chunk, ringChunk, "shader data");
+    for (auto chunk = chunkOf(offset); chunk <= lastChunkOf(offset, bytes); ++chunk) enterRingChunk(chunk);
     auto* base = reinterpret_cast<std::uint32_t*>(ringData + offset);
     ++counts.spansWritten;
-    spansWrittenWindow.fetch_add(1, std::memory_order_relaxed);
-    mark = {static_cast<std::uint32_t>(offset), static_cast<std::uint32_t>(words), ringChunks[offset / RingChunkBytes].entries};
+    mark = {static_cast<std::uint32_t>(offset), static_cast<std::uint32_t>(words), ringEntries};
     return {static_cast<std::uint32_t>(offset), std::span<std::uint32_t>(base, words)};
 }
 
-void BindlessHeap::enterChunk(std::vector<Chunk>& chunks, std::size_t index, std::size_t& current, const char* what) {
-    if (index == current) return;
-    current = index;
-    auto& chunk = chunks[index];
-    if (chunk.open) throw std::runtime_error(std::string("AGC bindless heap: one batch's ") + what + " exceeds its ring");
+std::size_t BindlessHeap::wrapRingOffset(std::size_t offset, std::size_t bytes) {
+    if (offset + bytes <= ringBytes) return offset;
+    ++counts.ringWraps;
+    return 0;
+}
+
+void BindlessHeap::enterRingChunk(std::size_t index) {
+    if (index == ringChunk) return;
+    ringChunk = index;
+    auto& chunk = ringChunks[index];
+    if (chunk.open) throw std::runtime_error("AGC bindless heap: one batch's shader data exceeds its ring");
     if (chunk.serial != 0u) {
-        ++counts.chunkWaits;
         if (!chunk.recorder->HasTimeline())
-            throw std::runtime_error(std::string("AGC bindless heap: the ") + what +
-                                     " ring needs the recorder timeline to wait for a batch");
+            throw std::runtime_error("AGC bindless heap: the shader data ring needs the recorder timeline to wait for a batch");
         chunk.recorder->WaitSerial(chunk.serial);
         chunk.serial = 0u;
     }
     chunk.open = true;
-    ++chunk.entries;
+    chunk.entered = ++ringEntries;
 }
 
 void BindlessHeap::writeSamplerSlot(std::uint32_t slot, VkSampler sampler) {
@@ -840,7 +595,7 @@ void BindlessHeap::writeSamplerSlot(std::uint32_t slot, VkSampler sampler) {
     Require(offset + samplerHeapStride <= samplerHeapUsed, "a GPU heap sampler slot lies outside the sampler heap");
     const VkHostAddressRangeEXT target{samplerHeap->Bytes().data() + offset, static_cast<std::size_t>(samplerHeapStride)};
     if (writeSamplerDescriptors == nullptr) writeSamplerDescriptors = context.Function<PFN_vkWriteSamplerDescriptorsEXT>("vkWriteSamplerDescriptorsEXT");
-    check(writeSamplerDescriptors(context.device, 1, record->Chain(), &target), "vkWriteSamplerDescriptorsEXT");
+    Check(writeSamplerDescriptors(context.device, 1, record->Chain(), &target), "vkWriteSamplerDescriptorsEXT");
 }
 
 void BindlessHeap::writeImageSlot(std::uint32_t kind, std::uint32_t slot, VkImageView view, VkImageLayout layout) {
@@ -856,7 +611,6 @@ void BindlessHeap::writeImageSlot(std::uint32_t kind, std::uint32_t slot, VkImag
     const auto stride = static_cast<std::size_t>(imageHeapStride);
     if (CopyEncodedImageView(view, key, std::span<std::byte>(target, stride))) {
         ++counts.encodedCopies;
-        imageCopiesWindow.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     auto record = FindImageView(view);
@@ -868,11 +622,10 @@ void BindlessHeap::writeImageSlot(std::uint32_t kind, std::uint32_t slot, VkImag
     encodeScratch.resize(stride);
     const VkHostAddressRangeEXT range{encodeScratch.data(), stride};
     if (writeResourceDescriptors == nullptr) writeResourceDescriptors = context.Function<PFN_vkWriteResourceDescriptorsEXT>("vkWriteResourceDescriptorsEXT");
-    check(writeResourceDescriptors(context.device, 1, &resource, &range), "vkWriteResourceDescriptorsEXT");
+    Check(writeResourceDescriptors(context.device, 1, &resource, &range), "vkWriteResourceDescriptorsEXT");
     std::memcpy(target, encodeScratch.data(), stride);
     KeepEncodedImageView(view, record->generation, key, encodeScratch);
     ++counts.encodes;
-    imageEncodesWindow.fetch_add(1, std::memory_order_relaxed);
 }
 
 namespace {
@@ -901,19 +654,17 @@ struct HeapBindingUse {
 using SetAndBinding = std::pair<std::uint32_t, std::uint32_t>;
 
 std::optional<std::unordered_map<std::uint32_t, SetAndBinding>> decoratedVariables(std::span<const std::uint32_t> spirv) {
-    constexpr std::uint32_t opDecorate = 71u;
-    constexpr std::uint32_t decorationBinding = 33u;
-    constexpr std::uint32_t decorationSet = 34u;
-    constexpr std::size_t headerWords = 5u;
-    if (spirv.size() < headerWords) return std::nullopt;
+    constexpr std::size_t HeaderWords = 5u;
+    constexpr std::uint32_t DecorateWords = 4u;
+    if (spirv.size() < HeaderWords) return std::nullopt;
     std::unordered_map<std::uint32_t, SetAndBinding> decorated;
-    for (std::size_t at = headerWords; at < spirv.size();) {
+    for (std::size_t at = HeaderWords; at < spirv.size();) {
         const auto count = spirv[at] >> 16u;
         if (count == 0u || at + count > spirv.size()) return std::nullopt;
-        if ((spirv[at] & 0xffffu) == opDecorate && count >= 4u) {
+        if ((spirv[at] & 0xffffu) == static_cast<std::uint32_t>(spv::OpDecorate) && count >= DecorateWords) {
             auto& entry = decorated.try_emplace(spirv[at + 1u], SetAndBinding{~0u, ~0u}).first->second;
-            if (spirv[at + 2u] == decorationSet) entry.first = spirv[at + 3u];
-            if (spirv[at + 2u] == decorationBinding) entry.second = spirv[at + 3u];
+            if (spirv[at + 2u] == static_cast<std::uint32_t>(spv::DecorationDescriptorSet)) entry.first = spirv[at + 3u];
+            if (spirv[at + 2u] == static_cast<std::uint32_t>(spv::DecorationBinding)) entry.second = spirv[at + 3u];
         }
         at += count;
     }
@@ -994,19 +745,30 @@ constexpr std::uint32_t rootAddressOffset(std::uint32_t rootField) {
     return (Abi::RootDword + rootField) * sizeof(std::uint32_t);
 }
 
+VkDescriptorSetAndBindingMappingEXT dataUniformMapping(std::uint32_t binding, VkDeviceSize heapOffset) {
+    constexpr auto bindingCount = static_cast<std::uint32_t>(Abi::Binding::Count);
+    VkDescriptorSetAndBindingMappingEXT mapping{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT};
+    mapping.descriptorSet = Abi::GpuDataSet;
+    mapping.firstBinding = binding;
+    mapping.bindingCount = 1;
+    mapping.resourceMask = VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT;
+    mapping.source = VK_DESCRIPTOR_MAPPING_SOURCE_RESOURCE_HEAP_DATA_EXT;
+    mapping.sourceData.heapData.heapOffset = static_cast<std::uint32_t>(heapOffset);
+    mapping.sourceData.heapData.pushOffset = rootAddressOffset(Abi::RootStageDword(static_cast<Abi::Stage>(binding / bindingCount), Abi::RootStageField::ShaderData));
+    return mapping;
+}
+
 }
 
 bool DescriptorHeapMappable(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress, bool pixelLds, bool meshWindow) {
     HeapBindingUse use;
     const bool mappable = heapBindings(spirv, {.workgroupAddress = workgroupAddress, .gdsAddress = gdsAddress, .pixelLds = pixelLds, .meshWindow = meshWindow}, use);
-    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    if (!mappable && stats) {
+    if (!mappable && pipelineStats()) {
         static std::mutex causesMutex;
         static std::map<SetAndBinding, std::uint64_t> causes;
         std::lock_guard lock(causesMutex);
         const auto count = ++causes[use.refused];
-        const bool powerOfTwo = (count & (count - 1u)) == 0u;
-        if (powerOfTwo) {
+        if (std::has_single_bit(count)) {
             std::fprintf(
                 stderr,
                 "[gpu-heap] unmappable stage: descriptor set %d binding %d (workgroup address %d, gds address %d); %llu stage variants with this cause\n",
@@ -1025,6 +787,7 @@ bool BindlessHeap::DescriptorHeapMappings(std::span<const std::uint32_t> spirv, 
     const HeapBindingRoots roots{
         .workgroupAddress = workgroupAddressOffset != ~0u, .gdsAddress = rootGds, .faultAddress = rootFault, .pixelLds = pixelLds, .meshWindow = meshWindow};
     if (!heapBindings(spirv, roots, use)) return false;
+    if (!use.dataUniforms.empty() && !ringInHeap) return false;
     constexpr auto bindingCount = static_cast<std::uint32_t>(Abi::Binding::Count);
     constexpr VkSpirvResourceTypeFlagsEXT imageResources = VK_SPIRV_RESOURCE_TYPE_SAMPLED_IMAGE_BIT_EXT |
                                                            VK_SPIRV_RESOURCE_TYPE_READ_ONLY_IMAGE_BIT_EXT |
@@ -1037,21 +800,7 @@ bool BindlessHeap::DescriptorHeapMappings(std::span<const std::uint32_t> spirv, 
                 heapMapping(Abi::FragmentDescriptorSet, binding, VK_SPIRV_RESOURCE_TYPE_SAMPLER_BIT_EXT, 0, samplerHeapStride));
         else mappings.push_back(heapMapping(Abi::FragmentDescriptorSet, binding, imageResources, 0, imageHeapStride));
     }
-    if (!use.dataUniforms.empty() && !ringInHeap) {
-        mappings.clear();
-        return false;
-    }
-    for (const auto binding : use.dataUniforms) {
-        VkDescriptorSetAndBindingMappingEXT mapping{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT};
-        mapping.descriptorSet = Abi::GpuDataSet;
-        mapping.firstBinding = binding;
-        mapping.bindingCount = 1;
-        mapping.resourceMask = VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT;
-        mapping.source = VK_DESCRIPTOR_MAPPING_SOURCE_RESOURCE_HEAP_DATA_EXT;
-        mapping.sourceData.heapData.heapOffset = static_cast<std::uint32_t>(ringHeapOffset);
-        mapping.sourceData.heapData.pushOffset = rootAddressOffset(Abi::RootStageDword(static_cast<Abi::Stage>(binding / bindingCount), Abi::RootStageField::ShaderData));
-        mappings.push_back(mapping);
-    }
+    for (const auto binding : use.dataUniforms) mappings.push_back(dataUniformMapping(binding, ringHeapOffset));
     if (use.workgroupMemory)
         mappings.push_back(pushAddressMapping(ShaderRecompiler::GpuWorkgroupMemoryDescriptorSet, 0, workgroupAddressOffset));
     if (use.gdsBinding != ~0u)
@@ -1140,8 +889,7 @@ constexpr std::array<const char*, static_cast<std::size_t>(HeapCost::Count)> Hea
     "template build", "slots",           "stage data",   "buffer addresses", "memo insert", "guards"};
 
 void reportHeapStatistics() {
-    static const bool enabled = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    if (!enabled) return;
+    if (!pipelineStats()) return;
     static std::atomic<std::uint64_t> calls{0};
     if ((calls.fetch_add(1, std::memory_order_relaxed) & 1023u) != 0u) return;
     static std::mutex reportMutex;
@@ -1176,11 +924,26 @@ void reportHeapStatistics() {
     const auto commandBuffers = takeCount(commandBuffersBegun);
     const auto copies = takeCount(cpuBufferCopies);
     const auto copiedMiB = takeCount(cpuBufferCopyBytes) >> 20u;
-    const auto spansWritten = takeCount(spansWrittenWindow);
-    const auto spansKept = takeCount(spansKeptWindow);
-    const auto spansExpired = takeCount(spansExpiredWindow);
-    const auto imageEncodes = takeCount(imageEncodesWindow);
-    const auto imageCopies = takeCount(imageCopiesWindow);
+    static BindlessHeap::Counts lastTotals;
+    BindlessHeap::Counts totals;
+    {
+        std::lock_guard heapsLock(heapsMutex());
+        for (const auto& entry : heaps()) {
+            const auto counts = entry.second->Statistics();
+            totals.spansWritten += counts.spansWritten;
+            totals.spansKept += counts.spansKept;
+            totals.spansExpired += counts.spansExpired;
+            totals.encodes += counts.encodes;
+            totals.encodedCopies += counts.encodedCopies;
+        }
+    }
+    const auto windowDelta = [](std::uint64_t now, std::uint64_t before) { return now >= before ? now - before : now; };
+    const auto spansWritten = windowDelta(totals.spansWritten, lastTotals.spansWritten);
+    const auto spansKept = windowDelta(totals.spansKept, lastTotals.spansKept);
+    const auto spansExpired = windowDelta(totals.spansExpired, lastTotals.spansExpired);
+    const auto imageEncodes = windowDelta(totals.encodes, lastTotals.encodes);
+    const auto imageCopies = windowDelta(totals.encodedCopies, lastTotals.encodedCopies);
+    lastTotals = totals;
     const auto templates = ShaderRecompiler::HeapTemplateCounts();
     std::fprintf(stderr,
                  "[gpu-heap] (10 s): draws %llu heap / %llu plain, dispatches %llu heap / %llu plain; "
@@ -1200,6 +963,7 @@ void forgetHeapBinding(VkCommandBuffer commands) {
 }
 
 void NoteHeapRecord(bool compute, bool heap) {
+    if (!pipelineStats()) return;
     heapRecords[heapRecordIndex(compute, heap)].fetch_add(1, std::memory_order_relaxed);
     reportHeapStatistics();
 }
@@ -1209,8 +973,7 @@ void NoteHeapStageReason(HeapStageReason reason) {
 }
 
 bool HeapCostTimed() {
-    static const bool timed = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    return timed;
+    return pipelineStats();
 }
 
 void NoteHeapCost(HeapCost cost, std::uint64_t nanoseconds) {
@@ -1246,7 +1009,7 @@ void CmdBindDescriptorSets(const Context& context, VkCommandBuffer commands, VkP
                            std::uint32_t firstSet, std::uint32_t setCount, const VkDescriptorSet* sets, SetBindSite site) {
     context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, firstSet, setCount,
                                                                                          sets, 0, nullptr);
-    setBinds[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+    if (pipelineStats()) setBinds[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
     forgetHeapBinding(commands);
 }
 

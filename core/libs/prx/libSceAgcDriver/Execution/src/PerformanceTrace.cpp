@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "ShaderDiskCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TraceFile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -56,6 +57,16 @@ struct Session {
     std::optional<TraceClockSample> gpuClock;
     std::vector<Clock::time_point> presents;
     bool bench = false;
+#ifdef _WIN32
+    std::int64_t intervalQpcBeginLo = 0;
+    std::int64_t intervalQpcBeginHi = 0;
+    std::int64_t intervalQpcEndLo = 0;
+    std::int64_t intervalQpcEndHi = 0;
+    std::int64_t intervalQpcFrequency = 0;
+    std::uint64_t observationSequence = 0;
+    bool intervalQpcValid = false;
+    bool observationFailure = false;
+#endif
     TraceBenchIntervals benchIntervals;
     std::uint64_t benchDropped = 0;
 };
@@ -74,6 +85,13 @@ std::unique_ptr<ProfileOutput>& summaryWriter() {
     static std::unique_ptr<ProfileOutput> output;
     return output;
 }
+
+#ifdef _WIN32
+std::unique_ptr<ProfileOutput>& observationWriter() {
+    static std::unique_ptr<ProfileOutput> output;
+    return output;
+}
+#endif
 
 std::unique_ptr<TraceBenchWriter>& benchWriter() {
     static std::unique_ptr<TraceBenchWriter> output;
@@ -299,6 +317,37 @@ void PerformanceTrace::FlushInterval(Clock::time_point now, std::uint32_t width,
     summary.firstPresent = state.intervalFirstPresent;
     summary.gpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs - state.intervalGpuBusy;
     summary.interval = std::make_pair(seconds(state.intervalPresents.front() - state.first), seconds(now - state.first));
+#ifdef _WIN32
+    ++state.observationSequence;
+    LARGE_INTEGER readLo{}, readHi{};
+    const bool beforeOk = QueryPerformanceCounter(&readLo) != 0;
+    try {
+        const auto observed = ShaderRecompiler::ShaderDiskCache::Observe();
+        const bool afterOk = QueryPerformanceCounter(&readHi) != 0;
+        const auto& c = observed.counters;
+        std::array<char, 2048> line{};
+        const int size = std::snprintf(line.data(), line.size(), "[cache-observation] id=%llu qpc_frequency=%lld trace_begin_lo=%lld trace_begin_hi=%lld trace_end_lo=%lld trace_end_hi=%lld read_lo=%lld read_hi=%lld valid=%u enabled=%u lost=%u active=%llu hits=%llu misses=%llu failures=%llu plan_hits=%llu plan_misses=%llu plan_failures=%llu prebuilt_hits=%llu prebuilt_misses=%llu prebuilt_rejected=%llu\n",
+            static_cast<unsigned long long>(state.observationSequence), static_cast<long long>(state.intervalQpcFrequency),
+            static_cast<long long>(state.intervalQpcBeginLo), static_cast<long long>(state.intervalQpcBeginHi),
+            static_cast<long long>(state.intervalQpcEndLo), static_cast<long long>(state.intervalQpcEndHi),
+            static_cast<long long>(readLo.QuadPart), static_cast<long long>(readHi.QuadPart),
+            static_cast<unsigned>(state.intervalQpcValid && beforeOk && afterOk && readLo.QuadPart <= readHi.QuadPart && !state.observationFailure),
+            static_cast<unsigned>(observed.enabled), static_cast<unsigned>(observed.lost), static_cast<unsigned long long>(observed.activeLoads),
+            static_cast<unsigned long long>(c.hits), static_cast<unsigned long long>(c.misses), static_cast<unsigned long long>(c.loadFailures),
+            static_cast<unsigned long long>(c.planHits), static_cast<unsigned long long>(c.planMisses), static_cast<unsigned long long>(c.planLoadFailures),
+            static_cast<unsigned long long>(c.prebuiltHits), static_cast<unsigned long long>(c.prebuiltMisses), static_cast<unsigned long long>(c.prebuiltRejected));
+        auto& output = observationWriter();
+        if (!output) output = std::make_unique<ProfileOutput>([](std::string_view text) {
+            if (std::fwrite(text.data(), 1, text.size(), stderr) != text.size() || std::fflush(stderr) != 0) throw std::runtime_error("cache observation output failed");
+            if (text.find("[cache-observation-end-ok]\n") != std::string_view::npos) {
+                if (std::fputs("[cache-observation-complete-ok]\n", stderr) == EOF || std::fflush(stderr) != 0) throw std::runtime_error("cache observation completion failed");
+            }
+        });
+        if (size < 0 || static_cast<std::size_t>(size) >= line.size() || !output->Write(std::string(line.data(), size))) state.observationFailure = true;
+    } catch (...) {
+        state.observationFailure = true;
+    }
+#endif
     summaryWriter()->Write(TraceFormat::Summary(summary, snapshots, state.intervalPresents));
     if (!state.bench) return;
     TraceBench::Keep(state.benchIntervals, std::make_shared<const TraceBenchInterval>(TraceBenchInterval{summary.interval->first, summary.interval->second, summary.firstPresent, width, height, summary.gpuBusyMs, TraceFormat::FrameMicroseconds(state.intervalPresents)}), state.benchDropped);
@@ -320,7 +369,15 @@ void PerformanceTrace::FlushInterval(Clock::time_point now, std::uint32_t width,
 }
 
 void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const VulkanDevice* device) {
+#ifdef _WIN32
+    LARGE_INTEGER qpcFrequency{}, qpcLo{}, qpcHi{};
+    const bool beforeOk = QueryPerformanceFrequency(&qpcFrequency) != 0 && QueryPerformanceCounter(&qpcLo) != 0;
+#endif
     const auto now = Clock::now();
+#ifdef _WIN32
+    const bool afterOk = QueryPerformanceCounter(&qpcHi) != 0;
+    const bool qpcValid = beforeOk && afterOk && qpcFrequency.QuadPart > 0 && qpcLo.QuadPart <= qpcHi.QuadPart;
+#endif
     BindThread("presenter");
     auto& state = session();
     std::lock_guard lock(state.mutex);
@@ -335,11 +392,28 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     const auto edge = state.window ? state.window->Present(present, now - state.first) : TraceWindow::Edge::None;
     if (state.interval) {
         if (!state.intervalOpen) {
+#ifdef _WIN32
+            state.intervalQpcBeginLo = qpcLo.QuadPart;
+            state.intervalQpcBeginHi = qpcHi.QuadPart;
+            state.intervalQpcFrequency = qpcFrequency.QuadPart;
+            state.intervalQpcValid = qpcValid;
+#endif
             OpenInterval(now, present);
         } else {
             state.intervalPresents.push_back(now);
             if (state.interval->Due(now - state.first)) {
+#ifdef _WIN32
+                state.intervalQpcEndLo = qpcLo.QuadPart;
+                state.intervalQpcEndHi = qpcHi.QuadPart;
+                state.intervalQpcValid = state.intervalQpcValid && qpcValid && state.intervalQpcFrequency == qpcFrequency.QuadPart && state.intervalQpcBeginHi <= qpcLo.QuadPart;
+#endif
                 FlushInterval(now, width, height, device);
+#ifdef _WIN32
+                state.intervalQpcBeginLo = qpcLo.QuadPart;
+                state.intervalQpcBeginHi = qpcHi.QuadPart;
+                state.intervalQpcFrequency = qpcFrequency.QuadPart;
+                state.intervalQpcValid = qpcValid;
+#endif
                 OpenInterval(now, present);
             }
         }
@@ -418,9 +492,29 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
 }
 
 void PerformanceTrace::StopOutput() {
+    bool outputOk = true;
+    try {
+        if (writer()) writer()->Flush();
+        if (summaryWriter()) summaryWriter()->Flush();
+        if (benchWriter()) benchWriter()->Flush();
+    } catch (...) { outputOk = false; }
     if (writer()) writer()->Stop();
     if (summaryWriter()) summaryWriter()->Stop();
     if (benchWriter()) benchWriter()->Stop();
+#ifdef _WIN32
+    auto& state = session();
+    bool valid = false;
+    {
+        std::lock_guard lock(state.mutex);
+        valid = outputOk && !state.observationFailure && state.observationSequence != 0;
+    }
+    if (observationWriter()) {
+        try {
+            (void)observationWriter()->Write(valid ? "[cache-observation-end-ok]\n" : "[cache-observation-end-failed]\n");
+        } catch (...) {}
+        observationWriter()->Stop();
+    }
+#endif
 }
 
 }

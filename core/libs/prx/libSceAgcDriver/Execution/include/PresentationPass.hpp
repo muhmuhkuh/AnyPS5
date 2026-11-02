@@ -3,6 +3,7 @@
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+#include "prx/libSceAgcDriver/Graphics/include/BindlessHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <cstddef>
 #include <cstdint>
@@ -45,7 +46,8 @@ private:
         VkPipeline pipeline = VK_NULL_HANDLE;
         VkPipeline heapPipeline = VK_NULL_HANDLE;
     };
-    struct Slot {
+    struct Slot : Graphics::HeapSlotOwner {
+        using Graphics::HeapSlotOwner::ReleaseHeapSlots;
         VkDescriptorSet set = VK_NULL_HANDLE;
         VkImageView source = VK_NULL_HANDLE;
         std::uint32_t width = 0;

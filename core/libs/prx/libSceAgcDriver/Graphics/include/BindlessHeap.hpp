@@ -18,6 +18,7 @@ namespace AgcDriver::Graphics {
 
 class Buffer;
 class Recorder;
+class HeapSlotOwner;
 class Sampler;
 class StorageTexture;
 class Texture;
@@ -32,14 +33,11 @@ public:
     static BindlessHeap& For(const Context& context);
     static BindlessHeap* Existing(const Context& context);
     static void Release(VkDevice device);
-    static std::uint64_t ReclaimStorageImages();
-    static std::unordered_map<const StorageTexture*, std::size_t> StorageOwnerCounts();
     static bool Fits(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties);
     static bool RingInResourceHeap(const VkPhysicalDeviceDescriptorHeapPropertiesEXT& properties, VkDeviceSize uniformAlignment);
 
     bool DescriptorHeapMode() const { return resourceHeap != nullptr; }
     VkDeviceSize ImageHeapStride() const { return imageHeapStride; }
-    VkDeviceSize SamplerHeapStride() const { return samplerHeapStride; }
     void BindDescriptorHeaps(VkCommandBuffer commands) const;
     bool DescriptorHeapMappings(std::span<const std::uint32_t> spirv, std::vector<VkDescriptorSetAndBindingMappingEXT>& mappings,
                                 std::uint32_t workgroupAddressOffset = ~0u, bool rootGds = false, bool rootFault = false,
@@ -50,15 +48,13 @@ public:
     VkBuffer RingBuffer() const;
     VkDeviceSize RingOffset() const;
 
-    std::optional<std::uint32_t> TextureSlot(std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view,
-                                             VkImageLayout layout);
-    std::optional<std::uint32_t> StorageSlot(std::uint32_t kind, std::shared_ptr<void> owner, VkImageView view);
-    std::optional<std::uint32_t> StorageSlot(std::uint32_t kind, const std::shared_ptr<StorageTexture>& image, VkImageView view);
-    std::optional<std::uint32_t> ViewSlot(std::uint32_t kind, const void* owner, VkImageView view);
-    void ReleaseViewSlots(const void* owner);
+    std::optional<std::uint32_t> TextureSlot(std::uint32_t kind, Texture* texture, VkImageView view, VkImageLayout layout);
+    std::optional<std::uint32_t> StorageSlot(std::uint32_t kind, const HeapSlotOwner* owner, VkImageView view);
+    std::optional<std::uint32_t> ViewSlot(std::uint32_t kind, const HeapSlotOwner* owner, VkImageView view);
+    void ReleaseSlots(const HeapSlotOwner* owner);
     std::uint32_t SlotGeneration(std::uint32_t slot) const;
     const Texture* SlotTexture(std::uint32_t kind, std::uint32_t slot) const;
-    bool SlotHoldsStorage(std::uint32_t kind, std::uint32_t slot, const void* owner, VkImageView view) const;
+    bool SlotHoldsStorage(std::uint32_t kind, std::uint32_t slot, const HeapSlotOwner* owner, VkImageView view) const;
     std::optional<std::uint32_t> SamplerSlot(const std::shared_ptr<Sampler>& sampler);
     std::uint32_t SamplerGeneration(std::uint32_t slot) const;
     std::uint64_t SlotSerial() const { return slotSerial.load(std::memory_order_acquire); }
@@ -67,9 +63,6 @@ public:
     std::uint32_t AbsentSlot(std::uint32_t kind, VkImageView view);
     static bool NearlyFull();
     static std::uint32_t ImageSlotCapacity();
-    static void NoteSweepDue();
-    static void NoteStorageEvicted();
-    static void SweepIfDue();
 
     struct DataSpan {
         std::uint32_t offset = 0;
@@ -88,11 +81,12 @@ public:
     void Submitted(Recorder& recorder, std::uint64_t serial);
 
     struct Counts {
-        std::uint64_t textures = 0, samplers = 0, full = 0, ringWraps = 0, encodes = 0, encodedCopies = 0;
-        std::uint64_t slotsFreed = 0, slotsReused = 0, sweeps = 0, chunkWaits = 0;
+        std::uint64_t ringWraps = 0, encodes = 0, encodedCopies = 0;
+        std::uint64_t slotsFreed = 0, slotsReused = 0;
         std::uint64_t spansWritten = 0, spansKept = 0, spansExpired = 0, keptChunksSkipped = 0;
     };
     Counts Statistics() const;
+    std::size_t RingChunkCount() const { return ringChunks.size(); }
 
     static constexpr std::size_t RingBytes = 64u << 20u;
     static constexpr std::size_t RingChunkBytes = 2u << 20u;
@@ -122,72 +116,94 @@ private:
         Recorder* recorder = nullptr;
         std::uint64_t serial = 0;
         bool open = false;
-        std::uint64_t entries = 0;
+        std::uint64_t entered = 0;
     };
     std::vector<Chunk> ringChunks;
+    std::uint64_t ringEntries = 0;
     std::size_t ringChunk = ~std::size_t{0};
-    void enterChunk(std::vector<Chunk>& chunks, std::size_t index, std::size_t& current, const char* what);
+    void enterRingChunk(std::size_t index);
+    std::size_t wrapRingOffset(std::size_t offset, std::size_t bytes);
     std::size_t ringCursor = 0;
     std::uint32_t ringAlignment = 256;
     mutable std::mutex mutex;
     std::atomic<std::uint64_t> slotSerial{1};
-    struct TextureKey {
+    struct ImageSlotKey {
         std::uint32_t kind;
-        const void* texture;
+        const HeapSlotOwner* owner;
         VkImageView view;
         VkImageLayout layout;
-        bool operator==(const TextureKey&) const = default;
+        bool operator==(const ImageSlotKey&) const = default;
     };
-    struct TextureKeyHash {
-        std::size_t operator()(const TextureKey& key) const {
-            const auto texture = std::hash<const void*>{}(key.texture);
-            const auto view = std::hash<const void*>{}(reinterpret_cast<const void*>(key.view));
-            return texture ^ view ^ (static_cast<std::size_t>(key.kind) << 48u) ^ (static_cast<std::size_t>(key.layout) << 40u);
+    struct ImageSlotKeyHash {
+        std::size_t operator()(const ImageSlotKey& key) const {
+            constexpr std::size_t HashSalt = 0x9e3779b97f4a7c15ull;
+            std::size_t seed = 0;
+            const auto mix = [&seed](std::size_t value) { seed ^= value + HashSalt + (seed << 6u) + (seed >> 2u); };
+            mix(key.kind);
+            mix(static_cast<std::size_t>(key.layout));
+            mix(std::hash<const HeapSlotOwner*>{}(key.owner));
+            mix(std::hash<const void*>{}(reinterpret_cast<const void*>(key.view)));
+            return seed;
         }
     };
-    std::unordered_map<TextureKey, std::uint32_t, TextureKeyHash> textureSlots;
-    std::unordered_map<const void*, std::vector<std::uint32_t>> viewSlots;
-    std::unordered_map<const void*, std::vector<std::uint32_t>> storageSlots;
-    std::uint32_t nextTextureSlot = 0;
+    std::unordered_map<ImageSlotKey, std::uint32_t, ImageSlotKeyHash> imageSlots;
+    std::unordered_map<const HeapSlotOwner*, std::vector<std::uint32_t>> ownerSlots;
+    struct SlotPool {
+        std::uint32_t next = 0;
+        std::uint32_t limit = 0;
+        std::vector<std::uint32_t> free;
+        std::vector<std::uint32_t> generations;
+        std::optional<std::uint32_t> Take(bool& reused);
+        void Free(std::uint32_t slot);
+        std::size_t Unused() const;
+        std::uint32_t Generation(std::uint32_t slot) const;
+    };
     struct SlotOwner {
-        std::shared_ptr<Texture> texture;
-        std::shared_ptr<void> storage;
-        const StorageTexture* image = nullptr;
-        TextureKey key{};
-        std::uint32_t generation = 0;
+        const Texture* texture = nullptr;
+        ImageSlotKey key{};
     };
     std::vector<SlotOwner> owners;
-    std::vector<std::uint32_t> freeSlots;
+    SlotPool imagePool;
+    SlotPool samplerPool;
     std::uint32_t slotCap = 0;
-    std::uint64_t slotRequests = 0;
-    void sweepLocked(std::vector<std::shared_ptr<Texture>>& dropped);
-    bool heldOnlyHereLocked(const void* owner, long uses) const;
-    std::optional<std::uint32_t> takeStorageSlot(std::uint32_t kind, std::shared_ptr<void> owner, VkImageView view, const StorageTexture* image);
-    bool releaseUncachedLocked(std::vector<std::shared_ptr<Texture>>& dropped, bool storagePhase);
-    void dropStorageLocked(const void* image, std::uint32_t slot);
-    std::optional<std::uint32_t> takeSlotLocked();
-    std::optional<std::uint32_t> takeOrSweepLocked(std::vector<std::shared_ptr<Texture>>& dropped);
-    SlotOwner& claimSlotLocked(const TextureKey& key, std::uint32_t slot);
+    std::optional<std::uint32_t> imageSlot(std::uint32_t kind, const HeapSlotOwner* owner, VkImageView view, VkImageLayout layout, Texture* texture);
+    SlotOwner& claimSlotLocked(const ImageSlotKey& key, std::uint32_t slot);
     void freeSlotLocked(std::uint32_t slot);
     const SlotOwner* ownerLocked(std::uint32_t slot) const;
-    std::unordered_map<const Sampler*, std::uint32_t> samplerSlots;
+    std::unordered_map<const HeapSlotOwner*, std::uint32_t> samplerSlots;
     std::unordered_set<std::uint32_t> absentSlots;
-    std::vector<std::shared_ptr<Sampler>> heldSamplers;
-    std::vector<std::uint32_t> samplerGenerations;
-    std::vector<std::uint32_t> freeSamplerSlots;
-    void sweepSamplersLocked(std::vector<std::shared_ptr<Sampler>>& dropped);
-    void noteTakenLocked(std::vector<std::shared_ptr<Texture>>& dropped);
-    void noteSamplerTakenLocked(std::vector<std::shared_ptr<Sampler>>& dropped);
+    bool refused = false;
+    void noteRefusedLocked(const char* what, std::uint32_t margin);
+    void noteTakenLocked();
+    void noteSamplerTakenLocked();
+    void noteReleasedLocked();
     std::uint32_t imageMargin() const;
-    std::size_t unusedLocked() const;
     bool roomLocked() const;
     Counts counts;
+};
+
+class HeapSlotOwner {
+public:
+    HeapSlotOwner(const HeapSlotOwner&) = delete;
+    HeapSlotOwner& operator=(const HeapSlotOwner&) = delete;
+
+protected:
+    HeapSlotOwner() = default;
+    ~HeapSlotOwner() = default;
+    void ReleaseHeapSlots(const Context& context) noexcept {
+        if (heapSlotted.exchange(false, std::memory_order_acq_rel)) {
+            if (auto* heap = BindlessHeap::Existing(context)) heap->ReleaseSlots(this);
+        }
+    }
+
+private:
+    friend class BindlessHeap;
+    mutable std::atomic<bool> heapSlotted{false};
 };
 
 bool GpuHeapEnabled();
 void SetDescriptorHeapDevice(bool available);
 bool DescriptorHeapEnabled();
-bool HeapComputeEnabled();
 bool DescriptorHeapMappable(std::span<const std::uint32_t> spirv, bool workgroupAddress, bool gdsAddress, bool pixelLds = false, bool meshWindow = false);
 void NoteHeapComputeStage();
 std::uint64_t HeapComputeStages();
