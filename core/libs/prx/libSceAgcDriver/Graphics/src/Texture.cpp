@@ -445,14 +445,11 @@ void ReportStorageBacking(std::span<const VkImage> build, std::uint64_t serial) 
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
     auto* recorder = Recorder::Active();
     ReportBufferOwners(serial);
-    const auto heapOwners = BindlessHeap::StorageOwnerCounts();
     const auto pins = recorder != nullptr ? recorder->KeptOwnerStates() : std::map<const void*, std::array<std::size_t, 4>>{};
     auto& live = Live();
     std::lock_guard lock(live.mutex);
     std::array<std::uint64_t, 16> bytes{}, counts{};
     std::array<std::uint64_t, 4> pinBytes{}, pinCounts{};
-    std::uint64_t heapOnlyBytes = 0;
-    std::size_t heapOnlyCount = 0;
     std::uint64_t deferredOnlyBytes = 0;
     std::size_t deferredOnlyCount = 0;
     std::vector<StorageTexture*> largest;
@@ -464,8 +461,6 @@ void ReportStorageBacking(std::span<const VkImage> build, std::uint64_t serial) 
         if (snapshot[1] == 0) invalidCapacity += snapshot[0];
         const bool inBuild = std::find(build.begin(), build.end(), texture->Image()) != build.end();
         const auto uses = texture->weak_from_this().use_count();
-        const auto heap = heapOwners.find(texture);
-        if (!inBuild && !texture->Cached() && !texture->Dirty() && heap != heapOwners.end() && uses == static_cast<long>(heap->second)) { ++heapOnlyCount; heapOnlyBytes += texture->AllocationBytes(); }
         const auto found = pins.find(texture);
         if (found != pins.end()) {
             for (std::size_t i = 0; i < 4; ++i) if (found->second[i] != 0) { ++pinCounts[i]; pinBytes[i] += texture->AllocationBytes(); }
@@ -477,7 +472,6 @@ void ReportStorageBacking(std::span<const VkImage> build, std::uint64_t serial) 
         if (!inBuild) largest.push_back(texture);
     }
     std::fprintf(stderr, "[storage-cpu-owners] build=%llu owners=%zu capacity=%llu valid-logical=%llu no-valid-capacity=%llu saved-slots=%llu pending-tickets=%llu\n", static_cast<unsigned long long>(serial), live.textures.size(), static_cast<unsigned long long>(snapshotTotals[0]), static_cast<unsigned long long>(snapshotTotals[1]), static_cast<unsigned long long>(invalidCapacity), static_cast<unsigned long long>(snapshotTotals[2]), static_cast<unsigned long long>(snapshotTotals[3]));
-    std::fprintf(stderr, "[storage-heap-only] build=%llu count=%zu bytes=%llu\n", static_cast<unsigned long long>(serial), heapOnlyCount, static_cast<unsigned long long>(heapOnlyBytes));
     std::fprintf(stderr, "[storage-pins] build=%llu deferred-only=%zu/%llu open=%llu/%llu inflight=%llu/%llu deferred=%llu/%llu hold=%llu/%llu\n", static_cast<unsigned long long>(serial), deferredOnlyCount, static_cast<unsigned long long>(deferredOnlyBytes), static_cast<unsigned long long>(pinCounts[0]), static_cast<unsigned long long>(pinBytes[0]), static_cast<unsigned long long>(pinCounts[1]), static_cast<unsigned long long>(pinBytes[1]), static_cast<unsigned long long>(pinCounts[2]), static_cast<unsigned long long>(pinBytes[2]), static_cast<unsigned long long>(pinCounts[3]), static_cast<unsigned long long>(pinBytes[3]));
     std::fprintf(stderr, "[storage-backing] build=%llu", static_cast<unsigned long long>(serial));
     for (std::size_t i = 0; i < counts.size(); ++i) if (counts[i] != 0) std::fprintf(stderr, " {group=%zu count=%llu bytes=%llu}", i, static_cast<unsigned long long>(counts[i]), static_cast<unsigned long long>(bytes[i]));

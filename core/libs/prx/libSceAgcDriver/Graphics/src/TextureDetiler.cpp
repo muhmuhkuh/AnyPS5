@@ -224,7 +224,8 @@ VkFormat TextureDetiler::ImageElementFormat(std::uint32_t elementBytes) {
 
 VkDeviceAddress TextureDetiler::bufferAddress(VkBuffer buffer) const {
     if (addressedPipelineLayout == VK_NULL_HANDLE || !BufferPool::ForceAddresses()) return 0;
-    return BufferDeviceAddress(context, buffer);
+    const VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, buffer};
+    return context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &info);
 }
 
 VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image, bool addressed, bool heap) {
