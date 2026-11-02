@@ -85,7 +85,7 @@ ShaderRecompiler::DescriptorImageShape shapeOf(const ShaderRecompiler::ImageReso
 DeviceImageTable::Slots DeviceImageTable::HeapSlots(const Context& context) {
     auto* heap = &BindlessHeap::For(context);
     Slots slots;
-    slots.take = [heap](std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view, VkImageLayout layout) { return heap->TextureSlot(kind, texture, view, layout); };
+    slots.take = [heap](std::uint32_t kind, const std::shared_ptr<Texture>& texture, VkImageView view, VkImageLayout layout) { return heap->TextureSlot(kind, texture.get(), view, layout); };
     slots.generation = [heap](std::uint32_t, std::uint32_t slot) { return heap->SlotGeneration(slot); };
     slots.serial = [heap] { return heap->SlotSerial(); };
     slots.nearlyFull = [] { return BindlessHeap::NearlyFull(); };

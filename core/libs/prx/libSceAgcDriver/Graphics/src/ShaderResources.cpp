@@ -5716,8 +5716,11 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             Require(!(element < binding.imageAtomic.size() && binding.imageAtomic[element]) && !(element < binding.imageAtomic64.size() && binding.imageAtomic64[element]), "storage image atomics on a multisampled texture are not implemented");
             storageTextures.push_back(nullptr);
             multisampleStorageViews.resize(storageTextures.size(), VK_NULL_HANDLE);
+            multisampleStorageOwners.resize(storageTextures.size(), nullptr);
             const bool uintStorage = UintStorageBinding(binding.binding);
-            multisampleStorageViews.back() = MultisampleTargetStorageView(context, resource, uintStorage);
+            const auto storage = MultisampleTargetStorageView(context, resource, uintStorage);
+            multisampleStorageViews.back() = storage.view;
+            multisampleStorageOwners.back() = storage.owner;
             multisampleSources.push_back(resource.baseAddress);
             storageMips.push_back(0);
             storageKeys.push_back(0);
@@ -6853,7 +6856,7 @@ void ShaderResources::writeHeapTableMap(const CompiledShader& shader, std::size_
             continue;
         }
         const auto view = textureFirstLayer[index] ? textures[index]->FirstLayerView() : textures[index]->View();
-        const auto slot = heap.TextureSlot(Abi::FirstImageBinding, textures[index], view, textures[index]->Layout());
+        const auto slot = heap.TextureSlot(Abi::FirstImageBinding, textures[index].get(), view, textures[index]->Layout());
         Require(slot.has_value(), "the global image heap is full");
         map.push_back(*slot);
     }
@@ -6863,7 +6866,7 @@ void ShaderResources::writeHeapTableMap(const CompiledShader& shader, std::size_
             map.push_back(storageAbsent);
             continue;
         }
-        const auto slot = heap.StorageSlot(Abi::FirstStorageImageBinding, storageTextures[index],
+        const auto slot = heap.StorageSlot(Abi::FirstStorageImageBinding, storageTextures[index].get(),
                                            storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index]));
         Require(slot.has_value(), "the global storage image heap is full");
         map.push_back(*slot);
@@ -6913,7 +6916,7 @@ void ShaderResources::writeHeapTableMap(const CompiledShader& shader, std::size_
                 auto& image = *storageTextures[index];
                 const auto view = wide ? image.Atomic64View(storageMips[index], storageFirstLayer[index])
                                        : image.AtomicView(storageMips[index], storageFirstLayer[index]);
-                const auto slot = heap.StorageSlot(kind, storageTextures[index], view);
+                const auto slot = heap.StorageSlot(kind, storageTextures[index].get(), view);
                 Require(slot.has_value(), "the global atomic image heap is full");
                 map.push_back(*slot);
             }
@@ -6932,7 +6935,7 @@ void ShaderResources::writeHeapTableMap(const CompiledShader& shader, std::size_
                 map.push_back(absent);
                 continue;
             }
-            const auto slot = heap.StorageSlot(kind, storageTextures[index], storageTextures[index]->UintStorageViewOrDefault(storageMips[index], storageFirstLayer[index]));
+            const auto slot = heap.StorageSlot(kind, storageTextures[index].get(), storageTextures[index]->UintStorageViewOrDefault(storageMips[index], storageFirstLayer[index]));
             Require(slot.has_value(), "the global storage image heap is full");
             map.push_back(*slot);
         }
@@ -6992,7 +6995,7 @@ void ShaderResources::appendHeapSlotKey(VkShaderStageFlags stageBit, std::vector
         } else if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
             for (const auto index : binding.imageAllocations) {
                 if (index != absent && storageTextures[index] == nullptr && heapMultisampleStorageView(index) != VK_NULL_HANDLE) {
-                    key.insert(key.end(), {0u, reinterpret_cast<std::uintptr_t>(heapMultisampleStorageView(index)),
+                    key.insert(key.end(), {reinterpret_cast<std::uintptr_t>(multisampleStorageOwners[index]), reinterpret_cast<std::uintptr_t>(heapMultisampleStorageView(index)),
                                            static_cast<std::uintptr_t>(VK_IMAGE_LAYOUT_GENERAL)});
                     continue;
                 }
@@ -7046,7 +7049,7 @@ void ShaderResources::takeHeapSlots(BindlessHeap& heap, HeapStageState& state, V
                 }
                 const auto view = reinterpret_cast<VkImageView>(key[cursor + 1]);
                 cursor += 3;
-                const auto slot = heap.TextureSlot(kind, textures[index], view, textures[index]->Layout());
+                const auto slot = heap.TextureSlot(kind, textures[index].get(), view, textures[index]->Layout());
                 Require(slot.has_value(), "the global image heap is full");
                 kindSlots.push_back(*slot);
             }
@@ -7056,7 +7059,7 @@ void ShaderResources::takeHeapSlots(BindlessHeap& heap, HeapStageState& state, V
                 if (index != absent && storageTextures[index] == nullptr && heapMultisampleStorageView(index) != VK_NULL_HANDLE) {
                     const auto view = reinterpret_cast<VkImageView>(key[cursor + 1]);
                     cursor += 3;
-                    const auto slot = heap.ViewSlot(kind, reinterpret_cast<const void*>(view), view);
+                    const auto slot = heap.ViewSlot(kind, multisampleStorageOwners[index], view);
                     Require(slot.has_value(), "the global storage image heap is full");
                     kindSlots.push_back(*slot);
                     continue;
@@ -7068,7 +7071,7 @@ void ShaderResources::takeHeapSlots(BindlessHeap& heap, HeapStageState& state, V
                 }
                 const auto view = reinterpret_cast<VkImageView>(key[cursor + 1]);
                 cursor += 3;
-                const auto slot = heap.StorageSlot(kind, storageTextures[index], view);
+                const auto slot = heap.StorageSlot(kind, storageTextures[index].get(), view);
                 Require(slot.has_value(), "the global storage image heap is full");
                 kindSlots.push_back(*slot);
             }
@@ -7114,7 +7117,7 @@ void ShaderResources::verifyHeapSlots(const BindlessHeap& heap, const HeapStageS
                 const auto view = heapMultisampleStorageView(index);
                 if (view == VK_NULL_HANDLE) continue;
                 ++storageChecked;
-                if (!bound || !heap.SlotHoldsStorage(kind, state.slots[kind][element], reinterpret_cast<const void*>(view), view)) ++storageWrong;
+                if (!bound || !heap.SlotHoldsStorage(kind, state.slots[kind][element], multisampleStorageOwners[index], view)) ++storageWrong;
                 continue;
             }
             ++storageChecked;
