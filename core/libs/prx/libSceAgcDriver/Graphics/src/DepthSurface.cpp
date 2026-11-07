@@ -728,18 +728,21 @@ public:
 
     void CheckResource(const GuestTextureResource& resource) const {
         if (target.samples == 1u) return;
+        const auto require = [&](bool condition, const char* reason) {
+            if (!condition) Require(false, std::string(reason) + DescribeRead(resource));
+        };
         const bool stencil = target.stencilAddress != 0u && resource.baseAddress == target.stencilAddress;
         const bool identity = stencil ? resource.format == 5u : resource.baseAddress == target.address && resource.format == (target.format == VK_FORMAT_D16_UNORM ? 7u : 22u);
-        Require(identity && resource.width == target.extent.width && resource.height == target.extent.height && resource.samples == target.samples, "native multisample depth sampled identity or format mismatch");
-        Require(resource.dimension == TextureDimension::k2DMsaa && resource.tileMode == TextureTileMode::kZ64KBX && resource.depthOrLastArray == 0u && resource.baseArray == 0u && resource.baseLevel == 0u && resource.lastLevel == 0u && resource.mipCount == 1u && resource.allocatedMipCount == 1u && resource.minLod == 0u, "native multisample depth sampled array, mip or layout is not implemented");
+        require(identity && resource.width == target.extent.width && resource.height == target.extent.height && resource.samples == target.samples, "native multisample depth sampled identity or format mismatch");
+        require(resource.dimension == TextureDimension::k2DMsaa && resource.tileMode == TextureTileMode::kZ64KBX && resource.depthOrLastArray == 0u && resource.baseArray == 0u && resource.baseLevel == 0u && resource.lastLevel == 0u && resource.mipCount == 1u && resource.allocatedMipCount == 1u && resource.minLod == 0u, "native multisample depth sampled array, mip or layout is not implemented");
         if (uniformPlaneTarget(target)) {
-            Require(resource.pipeBankXor == target.pipeBankXor && resource.dccAddress == 0u && !resource.dccAlphaOnMsb, "native multisample depth sampled metadata or XOR mismatch");
+            require(resource.pipeBankXor == target.pipeBankXor && resource.dccAddress == 0u && !resource.dccAlphaOnMsb, "native multisample depth sampled metadata or XOR mismatch");
             return;
         }
         const bool htile = resource.dccAddress == target.htileAddress && resource.dccPipeAligned == target.htilePipeAligned;
         const bool bare = resource.dccAddress == 0u && !resource.dccPipeAligned;
         if (stencil) {
-            Require(resource.pipeBankXor == target.pipeBankXor && bare && !resource.dccAlphaOnMsb && !target.htileStencil && target.htileDepthOnly, "native multisample depth sampled metadata or XOR mismatch");
+            require(resource.pipeBankXor == target.pipeBankXor && bare && !resource.dccAlphaOnMsb && !target.htileStencil && target.htileDepthOnly, "native multisample depth sampled metadata or XOR mismatch");
             return;
         }
         const bool layout = resource.pipeBankXor == target.pipeBankXor && resource.iterate256 == target.iterate256 && !resource.dccAlphaOnMsb;
@@ -747,7 +750,15 @@ public:
             static std::atomic<int> reports{0};
             if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] native multisample depth 0x%llx sampled through a descriptor without metadata before an in-place expand (last DB_RENDER_CONTROL 0x%08x)\n", static_cast<unsigned long long>(target.address), renderControl);
         }
-        Require(layout && (htile || (bare && expanded)), "native multisample depth sampled metadata or XOR mismatch");
+        require(layout && (htile || (bare && expanded)), "native multisample depth sampled metadata or XOR mismatch");
+    }
+
+    std::string DescribeRead(const GuestTextureResource& resource) const {
+        char text[768];
+        std::snprintf(text, sizeof(text), " (T# 0x%llx: format %u, %ux%u, %u samples, dimension %d, swizzle mode %u, XOR 0x%x, metadata 0x%llx%s%s%s, levels %u-%u of %u allocated %u, slices %u-%u, min LOD %u; target 0x%llx: stencil 0x%llx, vk format %d, %ux%u, %u samples, swizzle mode %u, XOR 0x%x, HTILE 0x%llx%s%s%s%s)",
+                      static_cast<unsigned long long>(resource.baseAddress), resource.format, resource.width, resource.height, resource.samples, static_cast<int>(resource.dimension), static_cast<unsigned>(resource.tileMode), resource.pipeBankXor, static_cast<unsigned long long>(resource.dccAddress), resource.dccPipeAligned ? " pipe-aligned" : "", resource.iterate256 ? " iterate256" : "", resource.dccAlphaOnMsb ? " alpha on MSB" : "", resource.baseLevel, resource.lastLevel, resource.mipCount, resource.allocatedMipCount, resource.baseArray, resource.depthOrLastArray, resource.minLod,
+                      static_cast<unsigned long long>(target.address), static_cast<unsigned long long>(target.stencilAddress), static_cast<int>(target.format), target.extent.width, target.extent.height, target.samples, target.depthSwizzle, target.pipeBankXor, static_cast<unsigned long long>(target.htileAddress), target.htilePipeAligned ? " pipe-aligned" : "", target.iterate256 ? " iterate256" : "", target.htileDepthOnly ? " depth only" : "", expanded ? ", expanded" : "");
+        return text;
     }
 
     void RequireStencilProven() const {
@@ -958,6 +969,12 @@ public:
     }
 
     void PublishToGuest();
+
+    void PublishForGuestRead() {
+        if (!hostWritten->load(std::memory_order_acquire)) return;
+        Require(!HoldsMultisampleTargetsLock(), "sample-preserving guest publication of native multisample depth is not implemented while a multisampled colour target is being acquired");
+        PublishToGuest();
+    }
 
     std::uint64_t written = ++depthWrites;
     std::shared_ptr<std::atomic<bool>> hostWritten = std::make_shared<std::atomic<bool>>(false);
@@ -3630,6 +3647,10 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     if (found == nullptr) return nullptr;
     const auto& base = found->target;
     const bool stencil = base.stencilAddress != 0 && resource.baseAddress == base.stencilAddress;
+    if (base.samples != 1u && resource.dimension != TextureDimension::k2DMsaa && found->samplingActive && !depthCopySourceActive) {
+        found->PublishForGuestRead();
+        return nullptr;
+    }
     if (stencil && BytesPerElement(resource.format) != 1u) return nullptr;
     if (stencil && found->StencilMirrorable()) found->SyncStencilFromMemory(stencilResource(base));
     if (base.samples != 1u || resource.dimension == TextureDimension::k2DMsaa) {

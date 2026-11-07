@@ -1569,6 +1569,108 @@ void CheckWrittenPublication(std::uint32_t samples, VkExtent2D extent, bool dept
     std::printf("Native depth publication samples=%u extent=%ux%u depthOnly=%u xor=0x%x: samples, HTILE and padding checked\n", samples, extent.width, extent.height, depthOnly, pipeBankXor);
 }
 
+std::array<std::uint32_t, 8> SingleSampleWords(std::uint64_t address, std::uint32_t pipeBankXor, std::uint32_t format, VkExtent2D extent) {
+    const auto base = (address | pipeBankXor) >> 8u;
+    const auto width = extent.width - 1u, height = extent.height - 1u;
+    return {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>((base >> 32u) & 255u) | (format << 20u) | ((width & 3u) << 30u), (width >> 2u) | (height << 14u), (9u << 28u) | (24u << 20u) | 0xfacu, 0u, 0u, 0u, 0u};
+}
+
+std::vector<std::array<std::uint32_t, 4>> FetchTexels(const Context& context, const Texture& texture, VkExtent2D extent, std::uint32_t fragments) {
+    const auto count = extent.width * extent.height * fragments;
+    if (auto* recorder = Recorder::Active()) recorder->Sync();
+    Buffer output(context, (count + 2u) * 16u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::memset(output.Bytes().data(), 0xa5, output.Bytes().size());
+    {
+        const Fetch fetch(context, texture, output, fragments == 1u ? SingleSampleFetchShader(extent.width, extent.height) : FetchShader(extent.width, extent.height, fragments, false, true));
+        CommandBatch batch(context);
+        fetch.Run(batch.Handle(), count);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+    }
+    output.Invalidate();
+    Require(std::all_of(output.Bytes().begin(), output.Bytes().begin() + 16u, [](auto byte) { return byte == std::byte{0xa5}; }) && std::all_of(output.Bytes().end() - 16u, output.Bytes().end(), [](auto byte) { return byte == std::byte{0xa5}; }), "a texel fetch changed its output guards");
+    std::vector<std::array<std::uint32_t, 4>> texels(count);
+    for (std::uint32_t index = 0u; index < count; ++index) std::memcpy(texels[index].data(), output.Bytes().data() + (index + 1u) * 16u, 16u);
+    return texels;
+}
+
+void CheckSingleSampleRead(AgcDriver::VulkanDevice& device, std::uint32_t samples, VkExtent2D extent, std::uint32_t pipeBankXor) {
+    const auto context = device.graphicsContext();
+    const auto depthBytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, 4u, samples));
+    const auto spanBytes = depthBytes + 4u * 65536u;
+    TargetMemory memory(spanBytes, true), metadata(65536u, true), guestCopy(spanBytes, true);
+    std::memset(metadata.Data(), 0, 65536u);
+    const auto guestByte = [](std::size_t offset) { return static_cast<std::byte>(offset * 7u + 3u); };
+    for (std::size_t offset = 0u; offset < spanBytes; ++offset) memory.Data()[offset] = guestByte(offset);
+    DepthTarget depth{memory.Address(), 0u, extent, VK_FORMAT_D32_SFLOAT, 0.0f, 0u, metadata.Address(), false, samples};
+    depth.depthSwizzle = 24u;
+    depth.pipeBankXor = pipeBankXor;
+    depth.htileDepthOnly = true;
+    depth.iterate256 = depth.htilePipeAligned = true;
+    struct Cleanup {
+        AgcDriver::VulkanDevice& device;
+        ~Cleanup() { device.WaitIdle(); ClearCachedTextures(device.Device()); ClearDepthSurfaces(device.Device()); }
+    } cleanup{device};
+    State state{};
+    state.stages = {ShaderPath::Vertex, 0u, 32u, 32u, std::nullopt, std::nullopt};
+    state.depth = depth;
+    state.depthTest = state.depthWrite = true;
+    state.depthCompare = VK_COMPARE_OP_ALWAYS;
+    state.renderExtent = extent;
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0f, 1.0f};
+    state.negativeOneToOne = false;
+    state.scissor = {{0, 0}, extent};
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.samples = samples;
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.spirv = DepthVertexShader();
+    vertex.variantId = 1u;
+    const AgcDriver::Pm4::DrawParameters draw{0u, 3u, 0u, 1u, 0u, false};
+    const VkExtent2D unfolded{extent.width * (samples == 8u ? 4u : 2u), extent.height * (samples == 2u ? 1u : 2u)};
+    std::optional<std::uint32_t> previous;
+    for (const auto& [written, variant] : std::array{std::pair{0.375f, 6u}, std::pair{0.625f, 7u}}) {
+        ShaderRecompiler::RecompileResult producer;
+        producer.spirv = DepthFeedbackFragmentShader(ShaderRecompiler::RuntimeAbi::FirstImageBinding, false, written);
+        producer.variantId = variant;
+        const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0u}, {ShaderRecompiler::ShaderStage::Fragment, &producer, PixelPushOffset(0u, device.Target())}}};
+        device.Draw(state, draw, shaders);
+        device.WaitIdle();
+        Require(DepthSurfaceAt(depth.address), "a draw left no resident native depth surface");
+        const auto drawn = std::bit_cast<std::uint32_t>(written);
+        for (const auto& [format, extentRead] : std::array{std::pair{22u, unfolded}, std::pair{1u, unfolded}, std::pair{22u, VkExtent2D{extent.width, extent.height}}}) {
+            const std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            const auto words = SingleSampleWords(depth.address, pipeBankXor, format, extentRead);
+            const auto foreign = CachedSampledTexture(context, words);
+            Require(foreign != nullptr, "a single-sample read of a written native depth surface returned no texture");
+            Require(DepthSurfaceAt(depth.address), "a single-sample read of a written native depth surface retired its owner");
+            Require(!DepthSurfaceHolds(context, DecodeTextureResource(words), foreign.get()), "a single-sample read of a native depth surface was served from its host samples");
+            const auto texels = FetchTexels(context, *foreign, extentRead, 1u);
+            std::memcpy(guestCopy.Data(), memory.Data(), spanBytes);
+            const auto reference = CachedSampledTexture(context, SingleSampleWords(guestCopy.Address(), pipeBankXor, format, extentRead));
+            Require(reference != nullptr, "the single-sample read of the copied guest bytes returned no texture");
+            Require(texels == FetchTexels(context, *reference, extentRead, 1u), "a single-sample read of a written native depth surface differs from the same read of its guest bytes");
+            if (format != 22u) continue;
+            Require(texels[0][0] == drawn, "a single-sample read of a written native depth surface did not see the drawn depth in its first texel");
+            Require(!previous || std::none_of(texels.begin(), texels.end(), [&](const auto& texel) { return texel[0] == *previous; }), "a single-sample read after a second draw still saw the first draw's depth");
+        }
+        previous = drawn;
+        const std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const auto nativeWords = DepthSampleWords(depth);
+        const auto native = CachedSampledTexture(context, nativeWords);
+        Require(native != nullptr && DepthSurfaceHolds(context, DecodeTextureResource(nativeWords), native.get()), "the native depth owner did not serve its own descriptor after a single-sample read");
+        for (const auto& texel : FetchTexels(context, *native, extent, samples)) Require(texel == std::array<std::uint32_t, 4>{drawn, 0u, 0u, std::bit_cast<std::uint32_t>(1.0f)}, "the native depth owner lost a drawn sample after a single-sample read");
+        auto otherXor = DecodeTextureResource(nativeWords);
+        otherXor.pipeBankXor ^= 0x100u;
+        TargetRefuses([&] { DepthSurfaceTexture(context, nativeWords, otherXor, VkComponentMapping{}); }, "native multisample depth sampled metadata or XOR mismatch (T# 0x");
+        auto otherFormat = DecodeTextureResource(nativeWords);
+        otherFormat.format = 20u;
+        TargetRefuses([&] { DepthSurfaceTexture(context, nativeWords, otherFormat, VkComponentMapping{}); }, "native multisample depth sampled identity or format mismatch (T# 0x");
+    }
+    std::printf("Native depth single-sample reads through the driver samples=%u extent=%ux%u xor=0x%x: guest bytes read as 32-bit float and 8-bit unorm at %ux%u and %ux%u after two draws, owner kept, other multisampled descriptors refused\n", samples, extent.width, extent.height, pipeBankXor, unfolded.width, unfolded.height, extent.width, extent.height);
+}
+
 void CheckDepthAttachmentAlias() {
     const auto device = OpenVulkanTestDevice();
     Require(device != nullptr, "native depth attachment alias requires Vulkan");
@@ -1989,7 +2091,7 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
             case 16u: changed.dccAlphaOnMsb = true; break;
             case 17u: changed.tileMode = TextureTileMode::kR64KBX; break;
         }
-        TargetRefuses([&] { DepthSurfaceTexture(context, words, changed, VkComponentMapping{}); }, "native multisample depth sampled");
+        TargetRefuses([&] { DepthSurfaceTexture(context, words, changed, VkComponentMapping{}); }, field == 4u ? "sample-preserving guest publication" : "native multisample depth sampled");
     }
     memory.Data()[bytes - 1u] = std::byte{0x5a};
     TargetRefuses([&] { CachedSampledTexture(context, words); }, "guest writes");
@@ -3437,6 +3539,24 @@ int main(int argc, char** argv) {
             return VulkanTestSkipped;
         }
         const auto context = device->GetContext();
+        if (argc == 2 && std::string_view(argv[1]) == "--single-sample-reads") {
+            std::uint32_t checked = 0u, unavailable = 0u;
+            const auto driver = OpenVulkanTestDevice();
+            Require(driver != nullptr, "single-sample reads of native depth through the driver require Vulkan");
+            for (const auto samples : {2u, 4u, 8u}) {
+                const bool supported = DepthSupported(driver->graphicsContext(), VK_FORMAT_D32_SFLOAT, samples);
+                Require(supported || samples == 8u, "single-sample reads of native depth through the driver require sampled D32 with " + std::to_string(samples) + " samples");
+                if (!supported) {
+                    ++unavailable;
+                    continue;
+                }
+                CheckSingleSampleRead(*driver, samples, {5u, 3u}, 0u);
+                CheckSingleSampleRead(*driver, samples, {70u, 67u}, 0x8c00u);
+                checked += 2u;
+            }
+            std::printf("Native depth single-sample read cases checked=%u unavailable=%u\n", checked, unavailable);
+            return 0;
+        }
         if (argc == 1) {
             for (const auto samples : {2u, 4u, 8u}) {
                 if (!DepthSupported(context, VK_FORMAT_D32_SFLOAT, samples)) continue;
